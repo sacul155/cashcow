@@ -1,34 +1,22 @@
-import { useEffect, useState } from 'react'
-import { Box, Card, CardContent, Chip, Container, Typography } from '@mui/material'
+import { BrowserRouter, Navigate, Route, Routes } from 'react-router'
 
-const API_URL = import.meta.env.VITE_API_URL
+import { AuthProvider } from './AuthContext.jsx'
+import ProtectedRoute from './ProtectedRoute.jsx'
+import HomePage from './pages/HomePage.jsx'
+import LoginPage from './pages/LoginPage.jsx'
 
 export default function App() {
-  const [status, setStatus] = useState('checking...')
-
-  useEffect(() => {
-    fetch(`${API_URL}/health`)
-      .then((response) => response.json())
-      .then((data) => setStatus(data.status))
-      .catch(() => setStatus('unreachable'))
-  }, [])
-
   return (
-    <Container maxWidth="sm">
-      <Box sx={{ mt: 8 }}>
-        <Card>
-          <CardContent>
-            <Typography variant="h4" gutterBottom>
-              CashCow
-            </Typography>
-            <Typography sx={{ mb: 2 }}>Backend API status:</Typography>
-            <Chip
-              label={status}
-              color={status === 'ok' ? 'success' : 'error'}
-            />
-          </CardContent>
-        </Card>
-      </Box>
-    </Container>
+    <BrowserRouter>
+      <AuthProvider>
+        <Routes>
+          <Route path="/login" element={<LoginPage />} />
+          <Route element={<ProtectedRoute />}>
+            <Route path="/" element={<HomePage />} />
+          </Route>
+          <Route path="*" element={<Navigate to="/" replace />} />
+        </Routes>
+      </AuthProvider>
+    </BrowserRouter>
   )
 }

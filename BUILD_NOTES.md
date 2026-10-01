@@ -103,7 +103,13 @@ cashcow/
 │   └── src/
 │       ├── main.jsx       # Starts React, applies the theme
 │       ├── theme.js       # Colors/fonts/spacing for all MUI components
-│       └── App.jsx        # Root component
+│       ├── App.jsx        # Router + AuthProvider + routes
+│       ├── api.js         # apiFetch: attaches token, handles errors/401
+│       ├── AuthContext.jsx # Login state shared across the app (useAuth hook)
+│       ├── ProtectedRoute.jsx # Redirects logged-out users to /login
+│       └── pages/
+│           ├── LoginPage.jsx
+│           └── HomePage.jsx   # Placeholder until the dashboard
 └── backend/
     ├── requirements.txt   # Exact list of Python packages + versions
     ├── .env               # Real settings (NOT committed to git)
@@ -448,6 +454,7 @@ Read `A ──< B` as "one A has many B". For example, one branch has many ATMs,
 
 - **PATCH** – An HTTP request that updates only the fields you send (unlike replacing the whole record).
 - **Primary key** (`primary_key=True`) – the column that uniquely identifies each row. SQLAlchemy makes an integer `id` that counts up automatically.
+- **Context** – A React feature that shares a value (like the logged-in user) with every component below a provider, without passing props through each layer.
 - **Component** – In React, a function that returns JSX describing part of the page.
 - **Foreign key** (`ForeignKey("branches.id")`) – a column that stores the `id` of a row in another table. This is how tables are linked, and the database refuses a value that doesn't exist in the other table.
 - **`relationship()`** – a Python-side shortcut that lets you write `atm.branch` or `branch.atms` instead of running a lookup yourself. It creates no column. `back_populates` links the two sides so they stay in sync.
@@ -1766,6 +1773,315 @@ Vite prints an address, usually `http://localhost:5173`. Open it.
 
 ---
 
+### Step 14 ✅ — Frontend authentication: API helper, React Context, login page, protected routes
+
+**Why:** The backend now requires a token, so the frontend needs a way to log in, remember who is logged in, send the token with every request, and keep logged-out users away from private pages.
+
+**Concepts:**
+
+- **React Context.** Normally data flows from parent to child through **props**. For something every page needs (like "who is logged in?"), passing it through every layer is tedious. **Context** lets a **provider** near the top of the app publish a value that any component below can read directly with a hook.
+- **Provider + hook pattern.** `AuthProvider` holds the state; a small `useAuth()` hook reads it. Any component calls `const { user, login, logout } = useAuth()`.
+- **Protected route.** A wrapper that shows a page only if someone is logged in, and otherwise redirects to `/login`.
+- **`localStorage`.** A small key-value store inside the browser that survives page reloads. We keep the token there so a refresh doesn't log you out. *Trade-off:* any script injected into the page could read it (an attack called XSS). That is acceptable for a learning project. More secure options are an `httpOnly` cookie (needs backend changes and CSRF protection) or keeping the token in memory only (users are logged out on every refresh).
+- **Session restore.** On page load, if a token is saved we ask `/auth/me` whether it is still valid. If the server answers `401` (expired or invalid), we log out.
+- **Controlled form.** Each field's value lives in React state (`useState`) and updates on every keystroke through `onChange`.
+
+**14a. API helper.** Every API call in the app goes through `apiFetch`, which attaches the token automatically, turns errors into readable messages, and logs the user out if the server rejects the token. `skipAuth` is for the login request itself, which has no token to send.
+
+**`frontend/src/api.js`**
+
+```js
+const API_URL = import.meta.env.VITE_API_URL
+const TOKEN_KEY = 'cashcow_token'
+
+export const getToken = () => localStorage.getItem(TOKEN_KEY)
+export const setToken = (token) => localStorage.setItem(TOKEN_KEY, token)
+export const clearToken = () => localStorage.removeItem(TOKEN_KEY)
+
+// The auth context registers a function here to run when the server rejects our token
+let onUnauthorized = () => {}
+export function setUnauthorizedHandler(handler) {
+  onUnauthorized = handler
+}
+
+export class ApiError extends Error {
+  constructor(status, message) {
+    super(message)
+    this.status = status
+  }
+}
+
+export async function apiFetch(path, { skipAuth = false, headers: extraHeaders, ...options } = {}) {
+  const token = skipAuth ? null : getToken()
+  const headers = { 'Content-Type': 'application/json', ...extraHeaders }
+  if (token) headers.Authorization = `Bearer ${token}`
+
+  let response
+  try {
+    response = await fetch(`${API_URL}${path}`, { ...options, headers })
+  } catch {
+    throw new ApiError(0, 'Cannot reach the server')
+  }
+
+  // A token was sent but rejected: it has expired or is invalid, so log out
+  if (response.status === 401 && token) onUnauthorized()
+
+  if (!response.ok) {
+    const body = await response.json().catch(() => null)
+    // FastAPI sends a string for most errors, but a list for validation errors (422)
+    const detail = Array.isArray(body?.detail) ? body.detail[0].msg : body?.detail
+    throw new ApiError(response.status, detail || 'Request failed')
+  }
+  return response.json()
+}
+```
+
+**14b. The auth context.** Note that `{children}` is everything wrapped inside the provider (the whole app). `useCallback` and `useMemo` keep function and object identities stable between renders so components reading the context don't re-render needlessly. If the backend is down on page load, the saved token is kept (only a real `401` clears it), so a refresh once the backend is back restores your session.
+
+**`frontend/src/AuthContext.jsx`**
+
+```jsx
+import { createContext, useCallback, useContext, useEffect, useMemo, useState } from 'react'
+
+import { apiFetch, clearToken, getToken, setToken, setUnauthorizedHandler } from './api.js'
+
+const AuthContext = createContext(null)
+
+export function AuthProvider({ children }) {
+  const [user, setUser] = useState(null)
+  // True while we check whether a saved token is still valid
+  const [loading, setLoading] = useState(Boolean(getToken()))
+
+  const logout = useCallback(() => {
+    clearToken()
+    setUser(null)
+  }, [])
+
+  // If any request gets a 401 for our token, log out
+  useEffect(() => {
+    setUnauthorizedHandler(logout)
+  }, [logout])
+
+  // On first load, restore the session from a saved token
+  useEffect(() => {
+    if (!getToken()) return
+    apiFetch('/auth/me')
+      .then(setUser)
+      .catch(() => {})
+      .finally(() => setLoading(false))
+  }, [])
+
+  const login = useCallback(async (email, password) => {
+    const { access_token } = await apiFetch('/auth/login', {
+      method: 'POST',
+      body: JSON.stringify({ email, password }),
+      skipAuth: true,
+    })
+    setToken(access_token)
+    try {
+      setUser(await apiFetch('/auth/me'))
+    } catch (error) {
+      clearToken()
+      throw error
+    }
+  }, [])
+
+  const value = useMemo(() => ({ user, loading, login, logout }), [user, loading, login, logout])
+
+  return <AuthContext.Provider value={value}>{children}</AuthContext.Provider>
+}
+
+export function useAuth() {
+  const context = useContext(AuthContext)
+  if (!context) throw new Error('useAuth must be used inside <AuthProvider>')
+  return context
+}
+```
+
+**14c. The protected-route wrapper.** `Outlet` is where the nested page appears once the check passes. We remember the page the user tried to visit in `state={{ from: location }}` so that after logging in they land there instead of always on the home page.
+
+**`frontend/src/ProtectedRoute.jsx`**
+
+```jsx
+import { Box, CircularProgress } from '@mui/material'
+import { Navigate, Outlet, useLocation } from 'react-router'
+
+import { useAuth } from './AuthContext.jsx'
+
+export default function ProtectedRoute() {
+  const { user, loading } = useAuth()
+  const location = useLocation()
+
+  if (loading) {
+    return (
+      <Box sx={{ display: 'flex', justifyContent: 'center', mt: 10 }}>
+        <CircularProgress />
+      </Box>
+    )
+  }
+  if (!user) {
+    return <Navigate to="/login" replace state={{ from: location }} />
+  }
+  return <Outlet />
+}
+```
+
+**14d. Pages.** Create the folder `frontend/src/pages/`. `event.preventDefault()` in the login form stops the browser's default behavior of reloading the page when a form is submitted.
+
+**`frontend/src/pages/LoginPage.jsx`**
+
+```jsx
+import { useState } from 'react'
+import { Alert, Box, Button, Card, CardContent, Container, TextField, Typography } from '@mui/material'
+import { Navigate, useLocation } from 'react-router'
+
+import { useAuth } from '../AuthContext.jsx'
+
+export default function LoginPage() {
+  const { user, login } = useAuth()
+  const location = useLocation()
+  const [email, setEmail] = useState('')
+  const [password, setPassword] = useState('')
+  const [error, setError] = useState('')
+  const [submitting, setSubmitting] = useState(false)
+
+  const destination = location.state?.from?.pathname ?? '/'
+
+  // Already logged in (including right after a successful login): leave this page
+  if (user) return <Navigate to={destination} replace />
+
+  async function handleSubmit(event) {
+    event.preventDefault()
+    setError('')
+    setSubmitting(true)
+    try {
+      await login(email, password)
+    } catch (err) {
+      setError(err.message)
+      setSubmitting(false)
+    }
+  }
+
+  return (
+    <Container maxWidth="xs">
+      <Box sx={{ mt: 12 }}>
+        <Card>
+          <CardContent>
+            <Typography variant="h4" gutterBottom>
+              CashCow
+            </Typography>
+            <Typography color="text.secondary" sx={{ mb: 3 }}>
+              Sign in to continue
+            </Typography>
+            <Box
+              component="form"
+              onSubmit={handleSubmit}
+              sx={{ display: 'flex', flexDirection: 'column', gap: 2 }}
+            >
+              {error && <Alert severity="error">{error}</Alert>}
+              <TextField
+                label="Email"
+                type="email"
+                value={email}
+                onChange={(event) => setEmail(event.target.value)}
+                autoComplete="email"
+                required
+                autoFocus
+              />
+              <TextField
+                label="Password"
+                type="password"
+                value={password}
+                onChange={(event) => setPassword(event.target.value)}
+                autoComplete="current-password"
+                required
+              />
+              <Button type="submit" variant="contained" size="large" disabled={submitting}>
+                {submitting ? 'Signing in...' : 'Sign in'}
+              </Button>
+            </Box>
+          </CardContent>
+        </Card>
+      </Box>
+    </Container>
+  )
+}
+```
+
+`HomePage.jsx` is a temporary placeholder until we build the dashboard:
+
+**`frontend/src/pages/HomePage.jsx`**
+
+```jsx
+import { Box, Button, Card, CardContent, Container, Typography } from '@mui/material'
+
+import { useAuth } from '../AuthContext.jsx'
+
+export default function HomePage() {
+  const { user, logout } = useAuth()
+
+  return (
+    <Container maxWidth="sm">
+      <Box sx={{ mt: 8 }}>
+        <Card>
+          <CardContent>
+            <Typography variant="h4" gutterBottom>
+              Welcome, {user.full_name}
+            </Typography>
+            <Typography sx={{ mb: 2 }}>You are logged in as {user.email}.</Typography>
+            <Button variant="outlined" onClick={logout}>
+              Log out
+            </Button>
+          </CardContent>
+        </Card>
+      </Box>
+    </Container>
+  )
+}
+```
+
+**14e. Wire it together.** `BrowserRouter` enables URL-based navigation. `AuthProvider` sits inside it, so every route can read the session. Routes nested inside `<Route element={<ProtectedRoute />}>` all get the login check, so later pages go there. The `*` route sends unknown URLs to `/`.
+
+**`frontend/src/App.jsx`**
+
+```jsx
+import { BrowserRouter, Navigate, Route, Routes } from 'react-router'
+
+import { AuthProvider } from './AuthContext.jsx'
+import ProtectedRoute from './ProtectedRoute.jsx'
+import HomePage from './pages/HomePage.jsx'
+import LoginPage from './pages/LoginPage.jsx'
+
+export default function App() {
+  return (
+    <BrowserRouter>
+      <AuthProvider>
+        <Routes>
+          <Route path="/login" element={<LoginPage />} />
+          <Route element={<ProtectedRoute />}>
+            <Route path="/" element={<HomePage />} />
+          </Route>
+          <Route path="*" element={<Navigate to="/" replace />} />
+        </Routes>
+      </AuthProvider>
+    </BrowserRouter>
+  )
+}
+```
+
+**14f. Try it.** With both servers running, open `http://localhost:5173`:
+
+1. You land on the **login page** (you aren't logged in).
+2. A wrong password shows a red alert: "Incorrect email or password".
+3. Correct credentials take you to the welcome card with your name and email.
+4. **Refresh the page**: you stay logged in (the brief spinner is the `/auth/me` check).
+5. **Log out** returns you to the login page.
+6. While logged out, visiting `http://localhost:5173/` redirects to `/login`.
+
+To see the saved token, open your browser's dev tools: **Application → Local Storage → `http://localhost:5173`**. The `cashcow_token` key exists while logged in and disappears after logout.
+
+---
+
 ---
 
 ## 6. Roadmap
@@ -1782,7 +2098,7 @@ Planned steps. Each becomes a numbered step above once built.
 - [x] Authentication (bcrypt password hashing + JWT login) — backend done; frontend login comes with the React app
 - [ ] Simulation logic (ATM cash levels, service dispatch)
 - [x] Frontend: React + Material UI project setup
-- [ ] Connect frontend to backend (API calls, CORS)
+- [x] Connect frontend to backend (API calls, CORS) — API helper and login done
 - [ ] Tests
 - [ ] Deployment notes
 
@@ -1797,6 +2113,7 @@ Planned steps. Each becomes a numbered step above once built.
 - **Foreign key** – A column holding the `id` of a row in another table, linking the two.
 - **Enum** – A type limited to a fixed list of named values.
 - **Salt** – Random data mixed into a password before hashing so identical passwords produce different hashes.
+- **localStorage** – A small key-value store in the browser that survives page reloads; we keep the login token there.
 - **Hash** – A one-way scramble of data (used for passwords); you can check a match but can't reverse it.
 - **Hook** – A React function like `useState` or `useEffect` that gives a component memory or side effects.
 - **JWT** – A signed token proving who a user is, sent with each request.
