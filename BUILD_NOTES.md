@@ -101,8 +101,13 @@ cashcow/
     │   ├── env.py         # Connects Alembic to our database and models
     │   └── versions/      # One script per database change
     └── app/
+        ├── main.py        # FastAPI app; run with uvicorn
         ├── config.py      # Loads settings from .env
-        ├── database.py    # SQLAlchemy engine + session factory
+        ├── database.py    # SQLAlchemy engine, session factory, get_db dependency
+        ├── routers/       # URL handlers, one file per resource
+        │   └── branches.py
+        ├── schemas/       # Pydantic request/response shapes
+        │   └── branch.py
         └── models/
             ├── __init__.py      # Imports every model (Alembic needs this)
             ├── base.py          # SQLAlchemy Base class all table models inherit from
@@ -704,6 +709,144 @@ To see a table's columns and links, run `psql cashcow -c "\d atms"`.
 
 ---
 
+### Step 10 ✅ — Build the first API: schemas, routes, and the FastAPI app
+
+**Why:** So far we have a database but no way for anything outside Python to use it. The **API** is the doorway: a set of URLs a browser or frontend can call to create and read data. We build one complete "vertical slice" for `Branch` first (schema → route → app). Once it works, the other entities repeat the same pattern.
+
+**Concepts:**
+
+- **Schema** (Pydantic) – a class describing the JSON shape of a request or response. It is separate from the SQLAlchemy model (which describes a database table), so the API can hide or reshape fields. For example, a future `User` model could store a password hash that no response schema ever includes.
+- **Router** – a group of related URLs (`/branches`, `/branches/{id}`) kept in its own file so `main.py` stays small.
+- **Dependency** (`Depends`) – FastAPI's way of handing each request something it needs (here, a database session) and cleaning up afterward.
+- **HTTP methods** – `POST` creates data, `GET` reads it. Status codes report the outcome: `201` created, `404` not found, `422` the data you sent was invalid.
+
+**10a. Add a session dependency.** Add this to the end of `backend/app/database.py`:
+
+```python
+
+def get_db():
+    db = SessionLocal()
+    try:
+        yield db
+    finally:
+        db.close()
+```
+
+Each request gets its own session, and `finally` always closes it, even if the request fails.
+
+**10b. Create the schemas.** Create the folder `backend/app/schemas/` with an empty `__init__.py`, then add `backend/app/schemas/branch.py`:
+
+```python
+from pydantic import BaseModel, ConfigDict, Field
+
+
+class BranchCreate(BaseModel):
+    name: str = Field(min_length=1, max_length=100)
+    region: str = Field(min_length=1, max_length=100)
+    capacity: int = Field(gt=0)
+    supervisor_id: int
+
+
+class BranchRead(BranchCreate):
+    id: int
+
+    model_config = ConfigDict(from_attributes=True)
+```
+
+`BranchCreate` is what a client sends (no `id`, because the database assigns it). `BranchRead` is what we return, so it adds `id`. `from_attributes=True` lets Pydantic read values from a SQLAlchemy object instead of only from a dictionary. The `Field(...)` rules mean bad input, such as an empty name or a capacity of 0, is rejected automatically with a clear error.
+
+**10c. Create the routes.** Create the folder `backend/app/routers/` with an empty `__init__.py`, then add `backend/app/routers/branches.py`:
+
+```python
+from fastapi import APIRouter, Depends, HTTPException, status
+from sqlalchemy import select
+from sqlalchemy.orm import Session
+
+from app.database import get_db
+from app.models import Branch
+from app.schemas.branch import BranchCreate, BranchRead
+
+router = APIRouter(prefix="/branches", tags=["branches"])
+
+
+@router.post("", response_model=BranchRead, status_code=status.HTTP_201_CREATED)
+def create_branch(data: BranchCreate, db: Session = Depends(get_db)):
+    branch = Branch(**data.model_dump())
+    db.add(branch)
+    db.commit()
+    db.refresh(branch)
+    return branch
+
+
+@router.get("", response_model=list[BranchRead])
+def list_branches(db: Session = Depends(get_db)):
+    return db.scalars(select(Branch).order_by(Branch.id)).all()
+
+
+@router.get("/{branch_id}", response_model=BranchRead)
+def get_branch(branch_id: int, db: Session = Depends(get_db)):
+    branch = db.get(Branch, branch_id)
+    if branch is None:
+        raise HTTPException(status_code=404, detail="Branch not found")
+    return branch
+```
+
+- `@router.post("")` handles `POST /branches`; `@router.get(...)` handles reads.
+- `data: BranchCreate` makes FastAPI parse and validate the JSON body for us.
+- `db: Session = Depends(get_db)` supplies the session from 10a.
+- `db.add` stages the new row, `db.commit` saves it, and `db.refresh` reloads it so the database-assigned `id` is available.
+- `response_model` filters and validates what we send back.
+- We use plain `def` instead of `async def` because our database driver is synchronous. FastAPI runs these functions in a thread pool, so requests don't block each other.
+
+**10d. Create the app.** Add `backend/app/main.py`:
+
+```python
+from fastapi import FastAPI
+
+from app.routers import branches
+
+app = FastAPI(title="CashCow API")
+
+app.include_router(branches.router)
+
+
+@app.get("/health", tags=["health"])
+def health():
+    return {"status": "ok"}
+```
+
+`app` is the application object that Uvicorn serves. `/health` is a trivial endpoint that confirms the server is up.
+
+**10e. Run it.** From inside `backend/`, with the virtual environment active and PostgreSQL running:
+
+```bash
+uvicorn app.main:app --reload
+```
+
+- `app.main:app` means "the object named `app` in the file `app/main.py`".
+- `--reload` restarts the server automatically when you save a file (development only).
+- Press `Ctrl+C` to stop the server.
+
+You should see `Uvicorn running on http://127.0.0.1:8000`.
+
+**10f. Try it.** Open **http://127.0.0.1:8000/docs**. FastAPI generated this interactive page from your code.
+
+1. Expand **POST /branches**, click **Try it out**, enter the following, and click **Execute**:
+   ```json
+   {"name": "Downtown", "region": "Northeast", "capacity": 10, "supervisor_id": 1}
+   ```
+   Expected: a `201` response with the same data plus an `id`.
+2. Try **GET /branches** (a list) and **GET /branches/1** (one branch). **GET /branches/999** should return `404`.
+3. Send a bad value, such as `"capacity": 0`. Expected: a `422` error explaining what was wrong.
+4. Confirm the data is really in the database:
+   ```bash
+   psql cashcow -c "select * from branches;"
+   ```
+
+> **Troubleshooting:** `ModuleNotFoundError: No module named 'app'` means you are not inside `backend/`. A `connection refused` error means PostgreSQL isn't running (see [Starting and stopping PostgreSQL](#starting-and-stopping-postgresql)).
+
+---
+
 ---
 
 ## 6. Roadmap
@@ -714,8 +857,9 @@ Planned steps. Each becomes a numbered step above once built.
 - [x] Configuration: `.env` file + `pydantic-settings` (database URL done; JWT secret added with authentication)
 - [x] SQLAlchemy table models (branches, technicians, ATMs, service calls, reports)
 - [x] Alembic setup and first migration
-- [ ] Pydantic schemas (request/response shapes)
-- [ ] FastAPI app entry point (`main.py`) and first routes
+- [x] Pydantic schemas (request/response shapes) — Branch done
+- [x] FastAPI app entry point (`main.py`) and first routes — Branch done
+- [ ] Schemas and routes for technicians, ATMs, service calls, and reports
 - [ ] Authentication (bcrypt password hashing + JWT login)
 - [ ] Simulation logic (ATM cash levels, service dispatch)
 - [ ] Frontend: React + Material UI project setup
@@ -737,7 +881,9 @@ Planned steps. Each becomes a numbered step above once built.
 - **Migration** – A versioned script that changes the database structure. Alembic runs them in order, so every copy of the database ends up identical.
 - **Primary key** – The column that uniquely identifies each row in a table.
 - **ORM** – Lets you work with database rows as Python objects.
+- **Router** – A group of related URLs in FastAPI, kept in its own file.
 - **Relationship** – A Python-side link between two models, such as `atm.branch`; it creates no database column.
+- **Schema** – A Pydantic class describing the JSON shape of a request or response (not a database table).
 - **Virtual environment** – An isolated set of Python packages for one project.
 
 ---
