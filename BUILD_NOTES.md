@@ -47,8 +47,9 @@ If a term is unfamiliar, see the [Glossary](#7-glossary).
 - **SQLAlchemy** – An **ORM** (Object-Relational Mapper). Lets us describe database tables as Python classes and query them with Python instead of hand-writing SQL.
 - **Alembic** – Database **migrations**. As our models change (new column, new table), Alembic records each change as a versioned script so every developer's database stays in sync. Think "git for your database schema".
 - **psycopg (v3)** – The driver that lets Python talk to PostgreSQL. SQLAlchemy uses it behind the scenes. `psycopg-binary` is a pre-compiled version so you don't need a C compiler.
-- **PyJWT** – Creates and verifies **JSON Web Tokens**, used for login sessions (planned).
-- **bcrypt** – Securely **hashes** passwords so we never store them in plain text (planned).
+- **PyJWT** – Creates and verifies **JSON Web Tokens**, used for login sessions.
+- **bcrypt** – Securely **hashes** passwords so we never store them in plain text.
+- **email-validator** – Lets Pydantic check that email addresses are well-formed (used by `EmailStr`).
 
 ### Database
 
@@ -102,16 +103,21 @@ cashcow/
     │   └── versions/      # One script per database change
     └── app/
         ├── main.py        # FastAPI app; run with uvicorn
+        ├── security.py    # Password hashing + JWT creation/verification
+        ├── dependencies.py # get_current_user (protects routes)
+        ├── create_user.py # Command-line script to create a login
         ├── config.py      # Loads settings from .env
         ├── database.py    # SQLAlchemy engine, session factory, get_db dependency
         ├── routers/       # URL handlers, one file per resource
         │   ├── utils.py   # get_or_404 helper
+        │   ├── auth.py    # /auth/login, /auth/me
         │   ├── branches.py
         │   ├── technicians.py
         │   ├── atms.py
         │   ├── service_calls.py
         │   └── reports.py
         ├── schemas/       # Pydantic request/response shapes
+        │   ├── auth.py
         │   ├── branch.py
         │   ├── technician.py
         │   ├── atm.py
@@ -125,7 +131,8 @@ cashcow/
             ├── technician.py    # technicians table
             ├── atm.py           # atms table
             ├── service_call.py  # service_calls table
-            └── report.py        # reports table
+            ├── report.py        # reports table
+            └── user.py          # users table (logins)
 ```
 
 Why a separate `backend/` folder? The frontend will get its own `frontend/` folder later. Keeping them apart means each has its own dependencies and they can be developed and deployed independently.
@@ -1216,6 +1223,371 @@ Then try the error cases:
 
 ---
 
+### Step 12 ✅ — Add authentication (login, JWT tokens, protected routes)
+
+**Why:** Until now anyone who could reach the API could read and change everything. Authentication proves *who* is calling. We'll add a `User` table, secure password storage, a login endpoint that returns a token, and require that token on every data endpoint. The frontend login will be built on top of this.
+
+**Concepts:**
+
+- **Hashing, not encrypting.** We never store passwords. `bcrypt` turns a password into a one-way scrambled string (a **hash**) with a random **salt** mixed in. At login we hash the attempt and compare. Nobody, including us, can recover the original password, and a leaked database doesn't reveal passwords.
+- **JWT (JSON Web Token).** After a successful login the server returns a signed token. The client sends it with every request in an `Authorization: Bearer <token>` header. The server verifies the signature, so it doesn't need to look anything up per session. A JWT is **signed, not encrypted**: anyone can read it, but nobody can alter it without the secret key. Never put secrets inside one.
+- **Secret key.** The server-only value used to sign tokens. If it leaks, anyone can forge logins, so it lives in `.env`, never in Git.
+- **401 vs 403.** `401 Unauthorized` means "you haven't proven who you are". `403 Forbidden` means "I know who you are, but you aren't allowed".
+- **CORS.** Browsers block a page served from one address (our frontend, `localhost:5173`) from calling an API at another (`localhost:8000`) unless the API explicitly allows it. We add that permission now so the frontend works later.
+- **No public registration.** If anyone could register themselves, the protection would mean nothing. We create users with a command-line script instead. An admin-only registration endpoint can come later.
+
+**12a. Install one package.** Pydantic's email validation needs a helper:
+
+```bash
+pip install email-validator
+pip freeze > requirements.txt
+```
+
+**12b. Add settings.** Generate a secret and copy the output:
+
+```bash
+openssl rand -hex 32
+```
+
+Add it to `backend/.env`:
+
+```
+JWT_SECRET=<paste the generated value here>
+```
+
+Add a placeholder (never the real value) to `backend/.env.example`:
+
+```
+JWT_SECRET=change-me
+```
+
+Replace `backend/app/config.py`:
+
+```python
+from pathlib import Path
+
+from pydantic_settings import BaseSettings, SettingsConfigDict
+
+BACKEND_DIR = Path(__file__).resolve().parent.parent
+
+
+class Settings(BaseSettings):
+    database_url: str
+    jwt_secret: str
+    jwt_algorithm: str = "HS256"
+    access_token_expire_minutes: int = 60
+    cors_origins: list[str] = ["http://localhost:5173"]
+
+    model_config = SettingsConfigDict(env_file=BACKEND_DIR / ".env")
+
+
+settings = Settings()
+```
+
+`jwt_secret` has no default, so the app refuses to start without one. Do this *before* running anything else, because Alembic loads the settings too. `cors_origins` is the address the Vite frontend will use.
+
+**12c. Create the `User` model and migration.**
+
+**`backend/app/models/user.py`**
+
+```python
+from sqlalchemy import String
+from sqlalchemy.orm import Mapped, mapped_column
+
+from app.models.base import Base
+
+
+class User(Base):
+    __tablename__ = "users"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    email: Mapped[str] = mapped_column(String(255), unique=True, index=True)
+    full_name: Mapped[str] = mapped_column(String(100))
+    hashed_password: Mapped[str] = mapped_column(String(255))
+```
+
+Add it to `backend/app/models/__init__.py` so Alembic can see it:
+
+```python
+from app.models.user import User
+```
+
+(and add `"User"` to `__all__`).
+
+Then generate, **read**, and apply the migration from `backend/`:
+
+```bash
+alembic revision --autogenerate -m "create users table"
+alembic upgrade head
+```
+
+The new file should contain one `op.create_table('users', ...)` and a unique index on `email`, and nothing else.
+
+**12d. Security helpers.** Password hashing and token creation/verification:
+
+**`backend/app/security.py`**
+
+```python
+from datetime import datetime, timedelta, timezone
+
+import bcrypt
+import jwt
+
+from app.config import settings
+
+
+def hash_password(password: str) -> str:
+    password_bytes = password.encode()
+    if len(password_bytes) > 72:  # bcrypt cannot handle longer passwords
+        raise ValueError("Password must be at most 72 bytes")
+    return bcrypt.hashpw(password_bytes, bcrypt.gensalt()).decode()
+
+
+def verify_password(password: str, hashed_password: str) -> bool:
+    try:
+        return bcrypt.checkpw(password.encode(), hashed_password.encode())
+    except ValueError:
+        return False
+
+
+def create_access_token(user_id: int) -> str:
+    expires = datetime.now(timezone.utc) + timedelta(
+        minutes=settings.access_token_expire_minutes
+    )
+    payload = {"sub": str(user_id), "exp": expires}
+    return jwt.encode(payload, settings.jwt_secret, algorithm=settings.jwt_algorithm)
+
+
+def decode_access_token(token: str) -> int | None:
+    """Return the user id inside a valid token, or None if it is invalid or expired."""
+    try:
+        payload = jwt.decode(
+            token, settings.jwt_secret, algorithms=[settings.jwt_algorithm]
+        )
+        return int(payload["sub"])
+    except (jwt.PyJWTError, KeyError, ValueError):
+        return None
+```
+
+`sub` ("subject") is the standard JWT field for who the token is about, and must be a string. `exp` is the expiry time; PyJWT automatically rejects expired tokens. bcrypt cannot handle passwords longer than 72 bytes, so we reject those rather than silently truncating.
+
+**12e. Schemas, the "who is logged in" dependency, and the auth routes.**
+
+**`backend/app/schemas/auth.py`**
+
+```python
+from pydantic import BaseModel, ConfigDict, EmailStr
+
+
+class LoginRequest(BaseModel):
+    email: EmailStr
+    password: str
+
+
+class Token(BaseModel):
+    access_token: str
+    token_type: str = "bearer"
+
+
+class UserRead(BaseModel):
+    id: int
+    email: EmailStr
+    full_name: str
+
+    model_config = ConfigDict(from_attributes=True)
+```
+
+`UserRead` deliberately has no `hashed_password`, so it can never leak in a response.
+
+**`backend/app/dependencies.py`**
+
+```python
+from fastapi import Depends, HTTPException
+from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
+from sqlalchemy.orm import Session
+
+from app.database import get_db
+from app.models import User
+from app.security import decode_access_token
+
+bearer_scheme = HTTPBearer(auto_error=False)
+
+
+def get_current_user(
+    credentials: HTTPAuthorizationCredentials | None = Depends(bearer_scheme),
+    db: Session = Depends(get_db),
+) -> User:
+    unauthorized = HTTPException(
+        status_code=401,
+        detail="Not authenticated",
+        headers={"WWW-Authenticate": "Bearer"},
+    )
+    if credentials is None:
+        raise unauthorized
+    user_id = decode_access_token(credentials.credentials)
+    if user_id is None:
+        raise unauthorized
+    user = db.get(User, user_id)
+    if user is None:
+        raise unauthorized
+    return user
+```
+
+Any route that depends on `get_current_user` returns `401` unless the request has a valid token for an existing user. `HTTPBearer` also adds an **Authorize** button to `/docs`.
+
+**`backend/app/routers/auth.py`**
+
+```python
+from fastapi import APIRouter, Depends, HTTPException
+from sqlalchemy import select
+from sqlalchemy.orm import Session
+
+from app.database import get_db
+from app.dependencies import get_current_user
+from app.models import User
+from app.schemas.auth import LoginRequest, Token, UserRead
+from app.security import create_access_token, verify_password
+
+router = APIRouter(prefix="/auth", tags=["auth"])
+
+
+@router.post("/login", response_model=Token)
+def login(data: LoginRequest, db: Session = Depends(get_db)):
+    user = db.scalar(select(User).where(User.email == data.email.lower()))
+    if user is None or not verify_password(data.password, user.hashed_password):
+        # Same message for both cases so attackers can't discover which emails exist
+        raise HTTPException(
+            status_code=401,
+            detail="Incorrect email or password",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
+    return Token(access_token=create_access_token(user.id))
+
+
+@router.get("/me", response_model=UserRead)
+def read_current_user(current_user: User = Depends(get_current_user)):
+    return current_user
+```
+
+Wrong email and wrong password return the same message, so an attacker can't discover which emails have accounts. `/auth/me` lets the frontend ask "who am I?" when a page reloads and a token is still stored.
+
+**12f. Protect the API and allow the frontend.** Replace `backend/app/main.py`:
+
+**`backend/app/main.py`**
+
+```python
+from fastapi import Depends, FastAPI
+from fastapi.middleware.cors import CORSMiddleware
+
+from app.config import settings
+from app.dependencies import get_current_user
+from app.routers import atms, auth, branches, reports, service_calls, technicians
+
+app = FastAPI(title="CashCow API")
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=settings.cors_origins,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+# Public: login
+app.include_router(auth.router)
+
+# Protected: every route in these routers requires a valid token
+protected = [Depends(get_current_user)]
+app.include_router(branches.router, dependencies=protected)
+app.include_router(technicians.router, dependencies=protected)
+app.include_router(atms.router, dependencies=protected)
+app.include_router(service_calls.router, dependencies=protected)
+app.include_router(reports.router, dependencies=protected)
+
+
+@app.get("/health", tags=["health"])
+def health():
+    return {"status": "ok"}
+```
+
+Passing `dependencies=protected` to `include_router` protects every route in a router without editing each one. `/auth/login` and `/health` stay public.
+
+**12g. A script to create users.**
+
+**`backend/app/create_user.py`**
+
+```python
+import argparse
+import getpass
+import sys
+
+from sqlalchemy import select
+
+from app.database import SessionLocal
+from app.models import User
+from app.security import hash_password
+
+
+def main():
+    parser = argparse.ArgumentParser(description="Create a CashCow user")
+    parser.add_argument("email")
+    parser.add_argument("full_name")
+    args = parser.parse_args()
+
+    password = getpass.getpass("Password: ")
+    if getpass.getpass("Confirm password: ") != password:
+        sys.exit("Passwords do not match")
+    if len(password) < 8:
+        sys.exit("Password must be at least 8 characters")
+
+    email = args.email.lower()
+    try:
+        hashed = hash_password(password)
+    except ValueError as error:
+        sys.exit(str(error))
+
+    with SessionLocal() as db:
+        if db.scalar(select(User).where(User.email == email)):
+            sys.exit(f"A user with email {email} already exists")
+        db.add(User(email=email, full_name=args.full_name, hashed_password=hashed))
+        db.commit()
+    print(f"Created user {email}")
+
+
+if __name__ == "__main__":
+    main()
+```
+
+`getpass` hides what you type, so the password never appears on screen or in your shell history. Run it from `backend/` with the virtual environment active:
+
+```bash
+python -m app.create_user admin@cashcow.com "Admin User"
+```
+
+`-m app.create_user` runs the file as part of the `app` package so its imports work. It asks for a password twice (at least 8 characters).
+
+> **Use a real-looking email domain.** Addresses ending in reserved names such as `.test` or `.local` are rejected by Pydantic's `EmailStr`. The script doesn't check this, so it will happily create an account that can never log in (you'd see a `422` at login). Use something like `admin@cashcow.com`. To fix a mistake: `psql cashcow -c "delete from users where email = 'wrong@address';"` and run the script again.
+
+**12h. Test it.** Start the server (`uvicorn app.main:app --reload`) and open **http://127.0.0.1:8000/docs**:
+
+1. **GET /branches** → `401 Not authenticated`. The API is locked. (Protected endpoints show a padlock.)
+2. **POST /auth/login** with your email and password → a response containing `access_token`. A wrong password gives `401`.
+3. Click **Authorize** (top right). Paste **only** the token string (it starts with `eyJ`), not the word `Bearer`, then click **Authorize** and **Close**. The padlocks should now look closed.
+4. **GET /branches** → `200`.
+5. **GET /auth/me** → your id, email, and name, with no password hash.
+6. **GET /health** → still works with no token.
+
+**Troubleshooting a `401` after logging in** (login alone doesn't apply the token; you must Authorize):
+
+| Cause | Fix |
+|---|---|
+| Never clicked Authorize | Do step 3 above |
+| Pasted `Bearer eyJ...` | The box adds `Bearer` itself; paste only the string starting with `eyJ` |
+| Extra quotes/spaces or a cut-off copy | Use the **Copy** button next to the response body |
+| Refreshed the page | `/docs` forgets the token on reload; authorize again |
+| Token older than 60 minutes | Log in again |
+
+---
+
 ---
 
 ## 6. Roadmap
@@ -1229,7 +1601,7 @@ Planned steps. Each becomes a numbered step above once built.
 - [x] Pydantic schemas (request/response shapes) — Branch done
 - [x] FastAPI app entry point (`main.py`) and first routes — Branch done
 - [x] Schemas and routes for technicians, ATMs, service calls, and reports
-- [ ] Authentication (bcrypt password hashing + JWT login)
+- [x] Authentication (bcrypt password hashing + JWT login) — backend done; frontend login comes with the React app
 - [ ] Simulation logic (ATM cash levels, service dispatch)
 - [ ] Frontend: React + Material UI project setup
 - [ ] Connect frontend to backend (API calls, CORS)
@@ -1242,9 +1614,11 @@ Planned steps. Each becomes a numbered step above once built.
 
 - **API** – A set of URLs a program can call to get or change data.
 - **CORS** – A browser security rule that blocks a frontend on one address from calling a backend on another unless the backend allows it.
+- **Bearer token** – A token sent in the `Authorization: Bearer <token>` header to prove who you are.
 - **Dependency** – A library your project relies on.
 - **Foreign key** – A column holding the `id` of a row in another table, linking the two.
 - **Enum** – A type limited to a fixed list of named values.
+- **Salt** – Random data mixed into a password before hashing so identical passwords produce different hashes.
 - **Hash** – A one-way scramble of data (used for passwords); you can check a match but can't reverse it.
 - **JWT** – A signed token proving who a user is, sent with each request.
 - **Migration** – A versioned script that changes the database structure. Alembic runs them in order, so every copy of the database ends up identical.
