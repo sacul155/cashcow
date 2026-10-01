@@ -122,6 +122,7 @@ cashcow/
     └── app/
         ├── main.py        # FastAPI app; run with uvicorn
         ├── security.py    # Password hashing + JWT creation/verification
+        ├── metrics.py     # Metric calculations (SQL queries)
         ├── dependencies.py # get_current_user (protects routes)
         ├── create_user.py # Command-line script to create a login
         ├── seed.py        # Loads sample data (python -m app.seed)
@@ -134,14 +135,16 @@ cashcow/
         │   ├── technicians.py
         │   ├── atms.py
         │   ├── service_calls.py
-        │   └── reports.py
+        │   ├── reports.py
+        │   └── metrics.py # /metrics/... endpoints
         ├── schemas/       # Pydantic request/response shapes
         │   ├── auth.py
         │   ├── branch.py
         │   ├── technician.py
         │   ├── atm.py
         │   ├── service_call.py
-        │   └── report.py
+        │   ├── report.py
+        │   └── metrics.py # Shapes of the metric results
         └── models/
             ├── __init__.py      # Imports every model (Alembic needs this)
             ├── base.py          # SQLAlchemy Base class all table models inherit from
@@ -454,6 +457,7 @@ Read `A ──< B` as "one A has many B". For example, one branch has many ATMs,
 **Concepts used in the code:**
 
 - **PATCH** – An HTTP request that updates only the fields you send (unlike replacing the whole record).
+- **Alias (SQL)** – A second name for the same table within one query, so it can be joined to itself or used twice.
 - **Check constraint** – A rule the database itself enforces on a column (for example, "exactly 5 digits"), even if the API is bypassed.
 - **Primary key** (`primary_key=True`) – the column that uniquely identifies each row. SQLAlchemy makes an integer `id` that counts up automatically.
 - **Context** – A React feature that shares a value (like the logged-in user) with every component below a provider, without passing props through each layer.
@@ -2452,6 +2456,488 @@ Then in `/docs` (log in and Authorize first):
 
 ---
 
+### Step 16 ✅ — Build the metrics API (alerts and reports computed in the backend)
+
+**Why:** The dashboard must answer five business questions. Each one needs data from several tables at once (ATMs, branches, technicians, service calls), grouped and counted. A database is built for exactly that, so we compute the answers in the backend with SQL and send the frontend finished results. This keeps one source of truth, avoids shipping every row to the browser, and lets us verify each answer against the seed data we designed. The alerts are computed **live on each request**, so they always reflect the current data. (Saving alerts with a history, or letting users acknowledge them, would be a bigger feature for later.)
+
+**The five metrics** (definitions agreed in Step 15):
+
+| # | Question | Endpoint |
+|---|---|---|
+| 1 | Which active ATMs are below 20% cash ($2,000 of a $10,000 reserve), across all branches? | `GET /metrics/low-cash-atms` |
+| 2 | Which technicians are assigned to an active call at an ATM outside their own branch? | `GET /metrics/technician-mismatches` |
+| 3 | What percentage of finished service calls were completed vs failed, per ATM model? | `GET /metrics/completion-by-model` |
+| 4 | Which branches have more than 30% of their ATMs in maintenance? | `GET /metrics/maintenance-alerts` |
+| 5 | How many technicians have active calls, per supervisor? | `GET /metrics/technicians-by-supervisor` |
+| | Everything above plus headline counts for dashboard cards, in one request | `GET /metrics/dashboard` |
+
+**How the code is organized:**
+
+- `config.py`: the business rules ($10,000, 20%, 30%) as **named settings**, never numbers buried in code. They can be overridden in `.env` (for example `LOW_CASH_THRESHOLD=0.25`) without touching code. We use `Decimal` (exact decimal arithmetic) so `10000 × 0.20` is exactly `2000.00`, with no floating-point surprises.
+- `schemas/metrics.py`: the JSON shape of each result.
+- `metrics.py`: the logic, one function per metric, each taking a database session.
+- `routers/metrics.py`: thin URL handlers that just call those functions. Keeping logic out of the router means other code (tests, a future simulation) can reuse the same functions.
+
+**SQL ideas used in `metrics.py`:**
+
+- **`aliased(Branch)`.** The mismatch query needs the `branches` table twice: once for the technician's branch and once for the ATM's branch. An alias is a second nickname for the same table.
+- **`count(...).filter(...)`.** Counts only rows matching a condition, so one query can produce "completed" and "failed" counts side by side.
+- **Outer join** (`completion_by_model`). Keeps ATM models that have no service calls, so they show up with 0 instead of vanishing. Their percentages are `null` ("no data"), which also avoids dividing by zero.
+- **`count(distinct ...)`.** A technician with two active calls counts once as a technician, while `active_calls` still counts both calls.
+- **The maintenance threshold comparison** (`in_maintenance > threshold * total`) is done in Python because there are only as many rows as branches. It is strictly "more than 30%".
+- **Every status is listed** in the dashboard summary, even with a count of 0, so the frontend can rely on the keys always existing.
+
+**16a. Add the settings.** Replace `backend/app/config.py`:
+
+**`backend/app/config.py`**
+
+```python
+from decimal import Decimal
+from pathlib import Path
+
+from pydantic_settings import BaseSettings, SettingsConfigDict
+
+BACKEND_DIR = Path(__file__).resolve().parent.parent
+
+
+class Settings(BaseSettings):
+    database_url: str
+    jwt_secret: str
+    jwt_algorithm: str = "HS256"
+    access_token_expire_minutes: int = 60
+    cors_origins: list[str] = ["http://localhost:5173"]
+
+    # Business rules used by the metrics
+    atm_cash_capacity: Decimal = Decimal("10000")  # a full cash reserve, in dollars
+    low_cash_threshold: Decimal = Decimal("0.20")  # below 20% of capacity is "low"
+    maintenance_alert_threshold: Decimal = Decimal("0.30")  # over 30% of a branch's ATMs
+
+    model_config = SettingsConfigDict(env_file=BACKEND_DIR / ".env")
+
+
+settings = Settings()
+```
+
+> **Troubleshooting:** If `low-cash-atms`, `maintenance-alerts` and `dashboard` return `500 Internal Server Error` while the other three work, this file wasn't updated. Those three read the new settings, and the traceback in the server terminal ends with `AttributeError: 'Settings' object has no attribute 'atm_cash_capacity'`. When any endpoint fails, read the **last lines** of the traceback in the terminal running uvicorn: they name the cause.
+
+Check that the settings load (from `backend/`, venv active). Expected output: `10000 0.20 0.30`.
+
+```bash
+python -c "from app.config import settings; print(settings.atm_cash_capacity, settings.low_cash_threshold, settings.maintenance_alert_threshold)"
+```
+
+**16b. Schemas.**
+
+**`backend/app/schemas/metrics.py`**
+
+```python
+from decimal import Decimal
+
+from pydantic import BaseModel
+
+from app.models.enums import ServiceStatus
+
+
+class LowCashATM(BaseModel):
+    id: int
+    serial_number: str
+    model: str
+    cash_level: Decimal
+    percent_full: float
+    branch_id: int
+    branch_name: str
+
+
+class BranchCount(BaseModel):
+    branch_id: int
+    branch_name: str
+    count: int
+
+
+class LowCashReport(BaseModel):
+    threshold_amount: Decimal
+    total: int
+    by_branch: list[BranchCount]
+    atms: list[LowCashATM]
+
+
+class TechnicianMismatch(BaseModel):
+    service_call_id: int
+    service_call_title: str
+    service_call_status: ServiceStatus
+    technician_id: int
+    technician_name: str
+    technician_branch_id: int
+    technician_branch_name: str
+    atm_id: int
+    atm_serial_number: str
+    atm_branch_id: int
+    atm_branch_name: str
+
+
+class ModelCompletion(BaseModel):
+    model: str
+    completed: int
+    failed: int
+    finished: int
+    completed_percent: float | None  # None when the model has no finished calls
+    failed_percent: float | None
+
+
+class MaintenanceAlert(BaseModel):
+    branch_id: int
+    branch_name: str
+    region: str
+    maintenance_atms: int
+    total_atms: int
+    percent_in_maintenance: float
+
+
+class SupervisorWorkload(BaseModel):
+    supervisor_id: int
+    technicians: int
+    active_calls: int
+
+
+class DashboardSummary(BaseModel):
+    total_atms: int
+    atms_by_status: dict[str, int]
+    service_calls_by_status: dict[str, int]
+    open_service_calls: int
+    critical_open_service_calls: int
+
+
+class Dashboard(BaseModel):
+    summary: DashboardSummary
+    low_cash: LowCashReport
+    technician_mismatches: list[TechnicianMismatch]
+    completion_by_model: list[ModelCompletion]
+    maintenance_alerts: list[MaintenanceAlert]
+    technicians_by_supervisor: list[SupervisorWorkload]
+```
+
+**16c. The metric logic.**
+
+**`backend/app/metrics.py`**
+
+```python
+from collections import Counter
+
+from sqlalchemy import func, select
+from sqlalchemy.orm import Session, aliased
+
+from app.config import settings
+from app.models import ATM, Branch, ServiceCall, Technician
+from app.models.enums import ATMStatus, ServicePriority, ServiceStatus
+from app.schemas.metrics import (
+    BranchCount,
+    Dashboard,
+    DashboardSummary,
+    LowCashATM,
+    LowCashReport,
+    MaintenanceAlert,
+    ModelCompletion,
+    SupervisorWorkload,
+    TechnicianMismatch,
+)
+
+ACTIVE_CALL_STATUSES = (ServiceStatus.PENDING, ServiceStatus.IN_PROGRESS)
+
+
+def percent(part: int, whole: int) -> float:
+    return round(part * 100 / whole, 1)
+
+
+def low_cash_atms(db: Session) -> LowCashReport:
+    """Operational ATMs holding less than the low-cash share of a full reserve."""
+    threshold_amount = settings.atm_cash_capacity * settings.low_cash_threshold
+    rows = db.execute(
+        select(ATM, Branch.name)
+        .join(Branch, Branch.id == ATM.branch_id)
+        .where(ATM.status == ATMStatus.OPERATIONAL, ATM.cash_level < threshold_amount)
+        .order_by(ATM.cash_level, ATM.id)
+    ).all()
+
+    atms = [
+        LowCashATM(
+            id=atm.id,
+            serial_number=atm.serial_number,
+            model=atm.model,
+            cash_level=atm.cash_level,
+            percent_full=percent(atm.cash_level, settings.atm_cash_capacity),
+            branch_id=atm.branch_id,
+            branch_name=branch_name,
+        )
+        for atm, branch_name in rows
+    ]
+    per_branch = Counter((atm.branch_id, atm.branch_name) for atm in atms)
+    by_branch = [
+        BranchCount(branch_id=branch_id, branch_name=branch_name, count=count)
+        for (branch_id, branch_name), count in sorted(per_branch.items())
+    ]
+    return LowCashReport(
+        threshold_amount=threshold_amount, total=len(atms), by_branch=by_branch, atms=atms
+    )
+
+
+def technician_mismatches(db: Session) -> list[TechnicianMismatch]:
+    """Active service calls whose technician works at a different branch than the ATM."""
+    technician_branch = aliased(Branch)
+    atm_branch = aliased(Branch)
+    rows = db.execute(
+        select(ServiceCall, Technician, ATM, technician_branch.name, atm_branch.name)
+        .select_from(ServiceCall)
+        .join(Technician, Technician.id == ServiceCall.technician_id)
+        .join(ATM, ATM.id == ServiceCall.atm_id)
+        .join(technician_branch, technician_branch.id == Technician.branch_id)
+        .join(atm_branch, atm_branch.id == ATM.branch_id)
+        .where(
+            ServiceCall.status.in_(ACTIVE_CALL_STATUSES),
+            Technician.branch_id != ATM.branch_id,
+        )
+        .order_by(ServiceCall.id)
+    ).all()
+
+    return [
+        TechnicianMismatch(
+            service_call_id=call.id,
+            service_call_title=call.title,
+            service_call_status=call.status,
+            technician_id=technician.id,
+            technician_name=technician.name,
+            technician_branch_id=technician.branch_id,
+            technician_branch_name=technician_branch_name,
+            atm_id=atm.id,
+            atm_serial_number=atm.serial_number,
+            atm_branch_id=atm.branch_id,
+            atm_branch_name=atm_branch_name,
+        )
+        for call, technician, atm, technician_branch_name, atm_branch_name in rows
+    ]
+
+
+def completion_by_model(db: Session) -> list[ModelCompletion]:
+    """Completed vs failed service calls (as a percentage of finished calls) per ATM model."""
+    rows = db.execute(
+        select(
+            ATM.model,
+            func.count(ServiceCall.id).filter(ServiceCall.status == ServiceStatus.COMPLETED),
+            func.count(ServiceCall.id).filter(ServiceCall.status == ServiceStatus.FAILED),
+        )
+        .select_from(ATM)
+        .outerjoin(ServiceCall, ServiceCall.atm_id == ATM.id)
+        .group_by(ATM.model)
+        .order_by(ATM.model)
+    ).all()
+
+    results = []
+    for model, completed, failed in rows:
+        finished = completed + failed
+        results.append(
+            ModelCompletion(
+                model=model,
+                completed=completed,
+                failed=failed,
+                finished=finished,
+                completed_percent=percent(completed, finished) if finished else None,
+                failed_percent=percent(failed, finished) if finished else None,
+            )
+        )
+    return results
+
+
+def maintenance_alerts(db: Session) -> list[MaintenanceAlert]:
+    """Branches where more than the alert share of ATMs are in maintenance."""
+    rows = db.execute(
+        select(
+            Branch.id,
+            Branch.name,
+            Branch.region,
+            func.count(ATM.id).filter(ATM.status == ATMStatus.MAINTENANCE),
+            func.count(ATM.id),
+        )
+        .join(ATM, ATM.branch_id == Branch.id)
+        .group_by(Branch.id)
+        .order_by(Branch.id)
+    ).all()
+
+    return [
+        MaintenanceAlert(
+            branch_id=branch_id,
+            branch_name=name,
+            region=region,
+            maintenance_atms=in_maintenance,
+            total_atms=total,
+            percent_in_maintenance=percent(in_maintenance, total),
+        )
+        for branch_id, name, region, in_maintenance, total in rows
+        if in_maintenance > settings.maintenance_alert_threshold * total
+    ]
+
+
+def technicians_by_supervisor(db: Session) -> list[SupervisorWorkload]:
+    """Technicians with at least one active call, grouped by their branch's supervisor."""
+    rows = db.execute(
+        select(
+            Branch.supervisor_id,
+            func.count(func.distinct(Technician.id)),
+            func.count(ServiceCall.id),
+        )
+        .select_from(ServiceCall)
+        .join(Technician, Technician.id == ServiceCall.technician_id)
+        .join(Branch, Branch.id == Technician.branch_id)
+        .where(ServiceCall.status.in_(ACTIVE_CALL_STATUSES))
+        .group_by(Branch.supervisor_id)
+        .order_by(Branch.supervisor_id)
+    ).all()
+
+    return [
+        SupervisorWorkload(supervisor_id=supervisor_id, technicians=technicians, active_calls=calls)
+        for supervisor_id, technicians, calls in rows
+    ]
+
+
+def summary(db: Session) -> DashboardSummary:
+    """Headline counts for the dashboard cards."""
+    atm_counts = dict(db.execute(select(ATM.status, func.count()).group_by(ATM.status)).all())
+    call_counts = dict(
+        db.execute(select(ServiceCall.status, func.count()).group_by(ServiceCall.status)).all()
+    )
+    critical_open = db.scalar(
+        select(func.count()).where(
+            ServiceCall.status.in_(ACTIVE_CALL_STATUSES),
+            ServiceCall.priority == ServicePriority.CRITICAL,
+        )
+    )
+    return DashboardSummary(
+        total_atms=sum(atm_counts.values()),
+        # Every status is listed, even with a count of 0, so the frontend can rely on the keys
+        atms_by_status={status.value: atm_counts.get(status, 0) for status in ATMStatus},
+        service_calls_by_status={
+            status.value: call_counts.get(status, 0) for status in ServiceStatus
+        },
+        open_service_calls=sum(call_counts.get(status, 0) for status in ACTIVE_CALL_STATUSES),
+        critical_open_service_calls=critical_open,
+    )
+
+
+def dashboard(db: Session) -> Dashboard:
+    return Dashboard(
+        summary=summary(db),
+        low_cash=low_cash_atms(db),
+        technician_mismatches=technician_mismatches(db),
+        completion_by_model=completion_by_model(db),
+        maintenance_alerts=maintenance_alerts(db),
+        technicians_by_supervisor=technicians_by_supervisor(db),
+    )
+```
+
+**16d. The routes.**
+
+**`backend/app/routers/metrics.py`**
+
+```python
+from fastapi import APIRouter, Depends
+from sqlalchemy.orm import Session
+
+from app import metrics
+from app.database import get_db
+from app.schemas.metrics import (
+    Dashboard,
+    LowCashReport,
+    MaintenanceAlert,
+    ModelCompletion,
+    SupervisorWorkload,
+    TechnicianMismatch,
+)
+
+router = APIRouter(prefix="/metrics", tags=["metrics"])
+
+
+@router.get("/low-cash-atms", response_model=LowCashReport)
+def get_low_cash_atms(db: Session = Depends(get_db)):
+    return metrics.low_cash_atms(db)
+
+
+@router.get("/technician-mismatches", response_model=list[TechnicianMismatch])
+def get_technician_mismatches(db: Session = Depends(get_db)):
+    return metrics.technician_mismatches(db)
+
+
+@router.get("/completion-by-model", response_model=list[ModelCompletion])
+def get_completion_by_model(db: Session = Depends(get_db)):
+    return metrics.completion_by_model(db)
+
+
+@router.get("/maintenance-alerts", response_model=list[MaintenanceAlert])
+def get_maintenance_alerts(db: Session = Depends(get_db)):
+    return metrics.maintenance_alerts(db)
+
+
+@router.get("/technicians-by-supervisor", response_model=list[SupervisorWorkload])
+def get_technicians_by_supervisor(db: Session = Depends(get_db)):
+    return metrics.technicians_by_supervisor(db)
+
+
+@router.get("/dashboard", response_model=Dashboard)
+def get_dashboard(db: Session = Depends(get_db)):
+    return metrics.dashboard(db)
+```
+
+**16e. Register the router** in `backend/app/main.py`: add `metrics` to the router import line and add `app.include_router(metrics.router, dependencies=protected)` after the other protected routers. It is protected like the other data routes. No migration is needed because the database structure didn't change.
+
+**`backend/app/main.py`**
+
+```python
+from fastapi import Depends, FastAPI
+from fastapi.middleware.cors import CORSMiddleware
+
+from app.config import settings
+from app.dependencies import get_current_user
+from app.routers import atms, auth, branches, metrics, reports, service_calls, technicians
+
+app = FastAPI(title="CashCow API")
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=settings.cors_origins,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+# Public: login
+app.include_router(auth.router)
+
+# Protected: every route in these routers requires a valid token
+protected = [Depends(get_current_user)]
+app.include_router(branches.router, dependencies=protected)
+app.include_router(technicians.router, dependencies=protected)
+app.include_router(atms.router, dependencies=protected)
+app.include_router(service_calls.router, dependencies=protected)
+app.include_router(reports.router, dependencies=protected)
+app.include_router(metrics.router, dependencies=protected)
+
+
+@app.get("/health", tags=["health"])
+def health():
+    return {"status": "ok"}
+```
+
+**16f. Verify.** The server reloads itself. In `/docs` (log in and Authorize first) you'll see a new **metrics** group. With the seed data from Step 15, expect:
+
+| Endpoint | Expected |
+|---|---|
+| `GET /metrics/low-cash-atms` | `total` 5 and `threshold_amount` `"2000.00"`, with one ATM in each branch. Serials `10017`, `10006`, `10003`, `10015`, `10011` at 8%, 9.5%, 12%, 15%, 17.5% full. ATM `10008` (exactly $2,000) is **not** listed |
+| `GET /metrics/technician-mismatches` | 3 items: Marcus Lee (Harbor) on a Downtown ATM, Daniel Kim (Lakeside) on a Harbor ATM, Tomas Silva (Riverside) on a Summit ATM |
+| `GET /metrics/completion-by-model` | Diebold Nixdorf 50% / 50%, Hyosung 0% / 100%, NCR 100% / 0% |
+| `GET /metrics/maintenance-alerts` | Downtown and Lakeside at 50.0%. Harbor (25%) is **absent** |
+| `GET /metrics/technicians-by-supervisor` | 101 → 1 technician, 102 → 2, 103 → 2 |
+| `GET /metrics/dashboard` | All of the above plus `summary`: 20 ATMs, 6 open service calls, 3 of them critical |
+
+Try the metrics responding to changes: `PATCH /atms/4` with `{"status": "Maintenance"}` makes Downtown 3 of 4 (75%), and ATM 4 stops counting as active. Set it back to `Operational` afterward (or re-run `python -m app.seed`).
+
+---
+
 ---
 
 ## 6. Roadmap
@@ -2467,7 +2953,9 @@ Planned steps. Each becomes a numbered step above once built.
 - [x] Schemas and routes for technicians, ATMs, service calls, and reports
 - [x] Authentication (bcrypt password hashing + JWT login) — backend done; frontend login comes with the React app
 - [x] Seed script with sample data covering every metric
-- [ ] Backend metrics endpoints (low cash, technician mismatches, completion ratio by model, maintenance alerts, technicians per supervisor)
+- [x] Backend metrics endpoints (low cash, technician mismatches, completion ratio by model, maintenance alerts, technicians per supervisor)
+- [ ] Frontend: app layout (top bar, navigation) and dashboard with metric cards, alerts and status badges
+- [ ] Frontend: DataGrid pages for ATMs and service calls (sorting, search, pagination)
 - [ ] Simulation logic (ATM cash levels, service dispatch)
 - [x] Frontend: React + Material UI project setup
 - [x] Connect frontend to backend (API calls, CORS) — API helper and login done
@@ -2481,6 +2969,7 @@ Planned steps. Each becomes a numbered step above once built.
 - **API** – A set of URLs a program can call to get or change data.
 - **CORS** – A browser security rule that blocks a frontend on one address from calling a backend on another unless the backend allows it.
 - **Bearer token** – A token sent in the `Authorization: Bearer <token>` header to prove who you are.
+- **Aggregation** – Combining many rows into a summary value, such as a count or percentage, usually with `GROUP BY`.
 - **Dependency** – A library your project relies on.
 - **Foreign key** – A column holding the `id` of a row in another table, linking the two.
 - **Enum** – A type limited to a fixed list of named values.

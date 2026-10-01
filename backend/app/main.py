@@ -3,7 +3,7 @@ from fastapi.middleware.cors import CORSMiddleware
 
 from app.config import settings
 from app.dependencies import get_current_user
-from app.routers import atms, auth, branches, reports, service_calls, technicians
+from app.routers import atms, auth, branches, metrics, reports, service_calls, technicians
 
 app = FastAPI(title="CashCow API")
 
@@ -24,6 +24,7 @@ app.include_router(technicians.router, dependencies=protected)
 app.include_router(atms.router, dependencies=protected)
 app.include_router(service_calls.router, dependencies=protected)
 app.include_router(reports.router, dependencies=protected)
+app.include_router(metrics.router, dependencies=protected)
 
 
 @app.get("/health", tags=["health"])
