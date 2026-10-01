@@ -124,6 +124,7 @@ cashcow/
         ├── security.py    # Password hashing + JWT creation/verification
         ├── dependencies.py # get_current_user (protects routes)
         ├── create_user.py # Command-line script to create a login
+        ├── seed.py        # Loads sample data (python -m app.seed)
         ├── config.py      # Loads settings from .env
         ├── database.py    # SQLAlchemy engine, session factory, get_db dependency
         ├── routers/       # URL handlers, one file per resource
@@ -453,6 +454,7 @@ Read `A ──< B` as "one A has many B". For example, one branch has many ATMs,
 **Concepts used in the code:**
 
 - **PATCH** – An HTTP request that updates only the fields you send (unlike replacing the whole record).
+- **Check constraint** – A rule the database itself enforces on a column (for example, "exactly 5 digits"), even if the API is bypassed.
 - **Primary key** (`primary_key=True`) – the column that uniquely identifies each row. SQLAlchemy makes an integer `id` that counts up automatically.
 - **Context** – A React feature that shares a value (like the logged-in user) with every component below a provider, without passing props through each layer.
 - **Component** – In React, a function that returns JSX describing part of the page.
@@ -2082,6 +2084,374 @@ To see the saved token, open your browser's dev tools: **Application → Local S
 
 ---
 
+### Step 15 ✅ — Seed sample data and enforce 5-digit serial numbers
+
+**Why:** An empty database makes a dashboard hard to build and impossible to judge. A **seed script** loads a known set of realistic sample data on demand. We designed it to contain exactly the situations our upcoming metrics must detect, so we can check each metric against numbers we know are right. In the same step we add a rule we had missed: every ATM serial number must be **unique and exactly 5 digits**.
+
+**What the seed data contains** (and which metric each part exercises):
+
+| Item | Data |
+|---|---|
+| Branches | 5, with supervisors `101` (Downtown, Harbor), `102` (Lakeside, Summit), `103` (Riverside) |
+| Technicians | 10 (2 per branch) |
+| ATMs | 20 (4 per branch), serials `10001`-`10020`, three models |
+| Low cash (below $2,000, status Operational) | exactly **5** ATMs. One more ATM sits at exactly $2,000.00 to prove the boundary is "strictly below" |
+| Maintenance alert (over 30% of a branch's ATMs) | **2** branches: Downtown and Lakeside (2 of 4 = 50% each). Harbor has 1 of 4 (25%) as a deliberate near-miss |
+| Service calls | 10: 3 active calls where the technician is at a *different branch* than the ATM, 2 active calls that match, 1 unassigned, 4 finished |
+| Completion/failure by model | NCR 1 completed / 0 failed, Diebold 1 / 1, Hyosung 0 / 1 |
+| Technicians on active calls by supervisor | 101 → 1, 102 → 2, 103 → 2 |
+
+**Business definitions used by the metrics** (agreed before building):
+
+- **Active ATM** – status `Operational` (not Maintenance, Offline or In-Transport).
+- **Full cash reserve** – $10,000, so "below 20%" means below $2,000. Cash can never exceed $10,000 (enforced in the API).
+- **Active service call** – status `Pending` or `In-Progress`.
+- **Mismatch** – an active call whose technician's branch differs from the ATM's branch.
+- **Completion/failure ratio** – completed % and failed % of *finished* calls (`Completed` + `Failed`) per ATM model.
+- **Supervisor report** – distinct technicians with at least one active call, grouped by `supervisor_id` of the technician's own branch.
+
+**15a. The seed script.** Notes on how it works:
+
+- The data sits in tables at the top (`BRANCHES`, `ATMS`, `SERVICE_CALLS`, ...) and the code that inserts it is at the bottom. To change the sample data, edit the tables.
+- Rows are inserted in dependency order: branches first, then technicians and ATMs (they need a `branch_id`), then service calls (they need ATM and technician ids), then reports. `db.flush()` sends pending inserts so PostgreSQL assigns ids the next group can use.
+- Branch ids and serial numbers are *calculated*, not typed: the ATMs are numbered 1-20 by `enumerate`, the serial is `10000 + number`, and the branch is `(number - 1) // 4` (four ATMs per branch, `//` is division that drops the remainder). **Consequence:** the order of the rows matters. Keep each branch's four ATMs together, and add new ATMs at the end.
+- `TRUNCATE ... RESTART IDENTITY` empties the five data tables and resets ids to 1, so the "ATM 3" and "technician 5" comments in the script always match the real ids. It never touches `users`, so your login survives. The script asks you to type `yes` first (`--yes` skips the prompt).
+- `capacity` is a placeholder value (8) because we never defined what it measures.
+
+**`backend/app/seed.py`**
+
+```python
+import argparse
+import sys
+from decimal import Decimal
+
+from sqlalchemy import text
+
+from app.database import SessionLocal
+from app.models import ATM, Branch, Report, ServiceCall, Technician
+from app.models.enums import ATMStatus, ServicePriority, ServiceStatus
+
+OPERATIONAL = ATMStatus.OPERATIONAL
+IN_TRANSPORT = ATMStatus.IN_TRANSPORT
+MAINTENANCE = ATMStatus.MAINTENANCE
+OFFLINE = ATMStatus.OFFLINE
+
+LOW = ServicePriority.LOW
+MEDIUM = ServicePriority.MEDIUM
+CRITICAL = ServicePriority.CRITICAL
+
+PENDING = ServiceStatus.PENDING
+IN_PROGRESS = ServiceStatus.IN_PROGRESS
+COMPLETED = ServiceStatus.COMPLETED
+FAILED = ServiceStatus.FAILED
+
+# name, region, capacity, supervisor_id
+BRANCHES = [
+    ("Downtown", "Northeast", 8, 101),
+    ("Harbor", "Northeast", 8, 101),
+    ("Lakeside", "Midwest", 8, 102),
+    ("Summit", "Midwest", 8, 102),
+    ("Riverside", "West", 8, 103),
+]
+
+# Two technicians per branch, in branch order: technicians 1-2 -> Downtown, 3-4 -> Harbor, ...
+TECHNICIANS = [
+    "Alex Rivera", "Priya Nair",
+    "Marcus Lee", "Sofia Garcia",
+    "Daniel Kim", "Hannah Brooks",
+    "Omar Hassan", "Lena Fischer",
+    "Tomas Silva", "Grace Okafor",
+]
+
+MODELS = ["NCR SelfServ 84", "Diebold Nixdorf DN 200", "Hyosung MX 8600"]
+
+# model index, status, cash_level. Four ATMs per branch, in branch order:
+# ATMs 1-4 -> Downtown, 5-8 -> Harbor, 9-12 -> Lakeside, 13-16 -> Summit, 17-20 -> Riverside
+ATMS = [
+    (0, MAINTENANCE, "6500.00"),   # 1  Downtown: 2 of 4 in maintenance (50%) -> alert
+    (1, MAINTENANCE, "4200.00"),   # 2
+    (2, OPERATIONAL, "1200.00"),   # 3  low cash
+    (0, OPERATIONAL, "8800.00"),   # 4
+    (1, MAINTENANCE, "3000.00"),   # 5  Harbor: 1 of 4 in maintenance (25%) -> no alert
+    (2, OPERATIONAL, "950.00"),    # 6  low cash
+    (0, OPERATIONAL, "7400.00"),   # 7
+    (1, OPERATIONAL, "2000.00"),   # 8  exactly 20% -> NOT low cash (boundary case)
+    (2, MAINTENANCE, "5100.00"),   # 9  Lakeside: 2 of 4 in maintenance (50%) -> alert
+    (0, MAINTENANCE, "9000.00"),   # 10
+    (1, OPERATIONAL, "1750.00"),   # 11 low cash
+    (2, OPERATIONAL, "6300.00"),   # 12
+    (0, OFFLINE, "4000.00"),       # 13 Summit
+    (1, IN_TRANSPORT, "5000.00"),  # 14
+    (2, OPERATIONAL, "1500.00"),   # 15 low cash
+    (0, OPERATIONAL, "9500.00"),   # 16
+    (1, OPERATIONAL, "800.00"),    # 17 Riverside, low cash
+    (2, OPERATIONAL, "6000.00"),   # 18
+    (0, OPERATIONAL, "10000.00"),  # 19 full reserve
+    (1, OPERATIONAL, "4400.00"),   # 20
+]
+
+# title, priority, status, atm number, technician number (None = unassigned)
+SERVICE_CALLS = [
+    # Active calls where the technician is NOT at the ATM's branch (3 mismatches)
+    ("Card reader jammed", CRITICAL, IN_PROGRESS, 4, 3),         # ATM Downtown, tech Harbor
+    ("Cash dispenser fault", MEDIUM, IN_PROGRESS, 7, 5),         # ATM Harbor, tech Lakeside
+    ("Screen unresponsive", LOW, PENDING, 16, 9),                # ATM Summit, tech Riverside
+    # Active calls where the technician is at the right branch
+    ("Receipt printer out of paper", LOW, IN_PROGRESS, 12, 6),   # Lakeside / Lakeside
+    ("Network connectivity loss", CRITICAL, PENDING, 19, 10),    # Riverside / Riverside
+    # Active call not yet assigned
+    ("Cash refill needed", CRITICAL, PENDING, 3, None),
+    # Finished calls (ATM models: 1 -> 100% completed, 2 -> 50/50, 3 -> 0% completed)
+    ("Keypad replaced", MEDIUM, COMPLETED, 1, 1),                # NCR
+    ("Cassette jam cleared", MEDIUM, COMPLETED, 5, 4),           # Diebold
+    ("Card skimmer inspection", CRITICAL, FAILED, 8, 3),         # Diebold
+    ("Software update", LOW, FAILED, 9, 5),                      # Hyosung
+]
+
+# service call number, file_url, notes
+REPORTS = [
+    (7, "https://example.com/reports/keypad-replacement.pdf", "Keypad replaced and tested."),
+    (8, "https://example.com/reports/cassette-jam.pdf", "Cleared jam; no hardware damage."),
+]
+
+
+def seed(db):
+    db.execute(
+        text(
+            "TRUNCATE TABLE reports, service_calls, atms, technicians, branches "
+            "RESTART IDENTITY CASCADE"
+        )
+    )
+
+    branches = [
+        Branch(name=name, region=region, capacity=capacity, supervisor_id=supervisor_id)
+        for name, region, capacity, supervisor_id in BRANCHES
+    ]
+    db.add_all(branches)
+    db.flush()  # sends the INSERTs so each row gets its id
+
+    technicians = [
+        Technician(name=name, branch_id=branches[index // 2].id)
+        for index, name in enumerate(TECHNICIANS)
+    ]
+    atms = [
+        ATM(
+            serial_number=str(10000 + number),
+            model=MODELS[model_index],
+            status=status,
+            cash_level=Decimal(cash_level),
+            branch_id=branches[(number - 1) // 4].id,
+        )
+        for number, (model_index, status, cash_level) in enumerate(ATMS, start=1)
+    ]
+    db.add_all(technicians + atms)
+    db.flush()
+
+    service_calls = [
+        ServiceCall(
+            title=title,
+            priority=priority,
+            status=status,
+            atm_id=atms[atm_number - 1].id,
+            technician_id=None if tech_number is None else technicians[tech_number - 1].id,
+        )
+        for title, priority, status, atm_number, tech_number in SERVICE_CALLS
+    ]
+    db.add_all(service_calls)
+    db.flush()
+
+    db.add_all(
+        Report(
+            file_url=file_url,
+            notes=notes,
+            service_call_id=service_calls[call_number - 1].id,
+        )
+        for call_number, file_url, notes in REPORTS
+    )
+    db.commit()
+
+
+def main():
+    parser = argparse.ArgumentParser(description="Load sample data into the CashCow database")
+    parser.add_argument("--yes", action="store_true", help="skip the confirmation prompt")
+    args = parser.parse_args()
+
+    if not args.yes:
+        answer = input(
+            "This DELETES all branches, technicians, ATMs, service calls and reports, "
+            "then loads sample data.\n(Users are not touched.) Type 'yes' to continue: "
+        )
+        if answer.strip().lower() != "yes":
+            sys.exit("Cancelled")
+
+    with SessionLocal() as db:
+        seed(db)
+    print("Seeded 5 branches, 10 technicians, 20 ATMs, 10 service calls, 2 reports")
+
+
+if __name__ == "__main__":
+    main()
+```
+
+Run it from `backend/` with the virtual environment active (`-m app.seed` runs the file as part of the `app` package so its imports work):
+
+```bash
+python -m app.seed
+```
+
+Type `yes`. Expected output: `Seeded 5 branches, 10 technicians, 20 ATMs, 10 service calls, 2 reports`.
+
+> **Do this before 15c.** Any ATM left over from earlier testing has an old-style serial (such as `ATM-0001`), and the migration in 15c would fail on it. Re-seeding wipes those rows.
+
+Check the data:
+
+```bash
+psql cashcow -c "select status, count(*) from atms group by status order by status;"
+psql cashcow -c "select count(*) from atms where status = 'Operational' and cash_level < 2000;"
+```
+
+Expected: In-Transport 1, Maintenance 5, Offline 1, Operational 13, then `5`.
+
+**15b. Validate the serial number and cash ceiling in the API.** Edit `backend/app/schemas/atm.py` so the serial must match a regular expression (`^[0-9]{5}$` means "from start to end, exactly five characters from 0 to 9") and cash can't exceed $10,000 (`le=10000`, "less than or equal"). The `le` rule must be on **both** `ATMCreate` and `ATMUpdate`; otherwise a PATCH could push cash above the ceiling and skew every percentage:
+
+**`backend/app/schemas/atm.py`**
+
+```python
+from decimal import Decimal
+
+from pydantic import BaseModel, ConfigDict, Field
+
+from app.models.enums import ATMStatus
+
+
+class ATMCreate(BaseModel):
+    serial_number: str = Field(pattern=r"^[0-9]{5}$")
+    model: str = Field(min_length=1, max_length=100)
+    status: ATMStatus = ATMStatus.OPERATIONAL
+    cash_level: Decimal = Field(default=Decimal("0"), ge=0, le=10000, max_digits=12, decimal_places=2)
+    branch_id: int
+
+
+class ATMUpdate(BaseModel):
+    model: str | None = Field(default=None, min_length=1, max_length=100)
+    status: ATMStatus | None = None
+    cash_level: Decimal | None = Field(default=None, ge=0, le=10000, max_digits=12, decimal_places=2)
+
+
+class ATMRead(ATMCreate):
+    id: int
+
+    model_config = ConfigDict(from_attributes=True)
+```
+
+**15c. Enforce the rule in the database too.** The API check gives friendly `422` messages, but a script, the seed or manual SQL bypasses it. A database **check constraint** is the last line of defense. In `backend/app/models/atm.py`:
+
+- import `CheckConstraint` from `sqlalchemy`,
+- add `__table_args__` with the constraint (`~` is PostgreSQL's regular-expression match; naming the constraint makes it easy to find in error messages),
+- change the column length from 50 to 5.
+
+**`backend/app/models/atm.py`**
+
+```python
+from decimal import Decimal
+
+from sqlalchemy import CheckConstraint, Enum, ForeignKey, Numeric, String
+from sqlalchemy.orm import Mapped, mapped_column, relationship
+
+from app.models.base import Base
+from app.models.enums import ATMStatus
+
+
+class ATM(Base):
+    __tablename__ = "atms"
+    __table_args__ = (
+        CheckConstraint("serial_number ~ '^[0-9]{5}$'", name="ck_atms_serial_number_format"),
+    )
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    serial_number: Mapped[str] = mapped_column(String(5), unique=True)
+    model: Mapped[str] = mapped_column(String(100))
+    status: Mapped[ATMStatus] = mapped_column(
+        Enum(ATMStatus, name="atm_status", values_callable=lambda e: [m.value for m in e]),
+        default=ATMStatus.OPERATIONAL,
+    )
+    cash_level: Mapped[Decimal] = mapped_column(Numeric(12, 2), default=0)
+    branch_id: Mapped[int] = mapped_column(ForeignKey("branches.id"))
+
+    branch: Mapped["Branch"] = relationship(back_populates="atms")
+    service_calls: Mapped[list["ServiceCall"]] = relationship(back_populates="atm")
+```
+
+Now create the migration. Note there is **no `--autogenerate`** this time:
+
+```bash
+alembic revision -m "require 5-digit atm serial numbers"
+```
+
+Autogenerate can notice the column length change but **cannot detect check constraints**, so it would silently omit the important part. Open the new file in `alembic/versions/` and replace the two empty functions with the following. Always write `downgrade()` as the exact reverse of `upgrade()` so the change can be undone:
+
+**`backend/alembic/versions/79faa9356345_require_5_digit_atm_serial_numbers.py`** (the two functions)
+
+```python
+def upgrade() -> None:
+    """Upgrade schema."""
+    op.alter_column(
+        "atms",
+        "serial_number",
+        existing_type=sa.String(length=50),
+        type_=sa.String(length=5),
+        existing_nullable=False,
+    )
+    op.create_check_constraint(
+        "ck_atms_serial_number_format", "atms", "serial_number ~ '^[0-9]{5}$'"
+    )
+
+
+def downgrade() -> None:
+    """Downgrade schema."""
+    op.drop_constraint("ck_atms_serial_number_format", "atms", type_="check")
+    op.alter_column(
+        "atms",
+        "serial_number",
+        existing_type=sa.String(length=5),
+        type_=sa.String(length=50),
+        existing_nullable=False,
+    )
+```
+
+Apply it:
+
+```bash
+alembic upgrade head
+```
+
+**15d. Verify.**
+
+```bash
+psql cashcow -c "\d atms"
+alembic check
+```
+
+Expected: `serial_number` is `character varying(5)`, a **Check constraints** section lists `ck_atms_serial_number_format`, and `alembic check` prints `No new upgrade operations detected.` (the model and database agree).
+
+Try to break it:
+
+```bash
+psql cashcow -c "insert into atms (serial_number, model, status, cash_level, branch_id) values ('ATM-1', 'x', 'Offline', 0, 1);"
+```
+
+Expected: `violates check constraint "ck_atms_serial_number_format"`.
+
+Then in `/docs` (log in and Authorize first):
+
+| Request | Expected |
+|---|---|
+| POST /atms with `"serial_number": "ATM-1"` | `422` (pattern mismatch) |
+| POST /atms with `"serial_number": "10001"` | `409` (already exists from the seed) |
+| PATCH /atms/1 with `"cash_level": "10000.01"` | `422` (over the ceiling) |
+
+---
+
 ---
 
 ## 6. Roadmap
@@ -2096,6 +2466,8 @@ Planned steps. Each becomes a numbered step above once built.
 - [x] FastAPI app entry point (`main.py`) and first routes — Branch done
 - [x] Schemas and routes for technicians, ATMs, service calls, and reports
 - [x] Authentication (bcrypt password hashing + JWT login) — backend done; frontend login comes with the React app
+- [x] Seed script with sample data covering every metric
+- [ ] Backend metrics endpoints (low cash, technician mismatches, completion ratio by model, maintenance alerts, technicians per supervisor)
 - [ ] Simulation logic (ATM cash levels, service dispatch)
 - [x] Frontend: React + Material UI project setup
 - [x] Connect frontend to backend (API calls, CORS) — API helper and login done
@@ -2122,7 +2494,9 @@ Planned steps. Each becomes a numbered step above once built.
 - **Primary key** – The column that uniquely identifies each row in a table.
 - **ORM** – Lets you work with database rows as Python objects.
 - **Router** – A group of related URLs in FastAPI, kept in its own file.
+- **Regular expression (regex)** – A compact pattern for matching text, such as `^[0-9]{5}$` for "exactly five digits".
 - **Relationship** – A Python-side link between two models, such as `atm.branch`; it creates no database column.
+- **Seed data** – Sample records loaded by a script so the app can be developed and tested against known data.
 - **Schema** – A Pydantic class describing the JSON shape of a request or response (not a database table).
 - **Virtual environment** – An isolated set of Python packages for one project.
 

@@ -1,6 +1,6 @@
 from decimal import Decimal
 
-from sqlalchemy import Enum, ForeignKey, Numeric, String
+from sqlalchemy import CheckConstraint, Enum, ForeignKey, Numeric, String
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from app.models.base import Base
@@ -9,9 +9,12 @@ from app.models.enums import ATMStatus
 
 class ATM(Base):
     __tablename__ = "atms"
+    __table_args__ = (
+        CheckConstraint("serial_number ~ '^[0-9]{5}$'", name="ck_atms_serial_number_format"),
+    )
 
     id: Mapped[int] = mapped_column(primary_key=True)
-    serial_number: Mapped[str] = mapped_column(String(50), unique=True)
+    serial_number: Mapped[str] = mapped_column(String(5), unique=True)
     model: Mapped[str] = mapped_column(String(100))
     status: Mapped[ATMStatus] = mapped_column(
         Enum(ATMStatus, name="atm_status", values_callable=lambda e: [m.value for m in e]),
