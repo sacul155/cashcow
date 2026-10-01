@@ -55,11 +55,14 @@ If a term is unfamiliar, see the [Glossary](#7-glossary).
 
 - **PostgreSQL** – A robust, free, open-source relational database. Chosen because bank-style data (accounts, transactions, relationships between records) fits tables and strict rules well.
 
-### Frontend (planned)
+### Frontend
 
-- **React** – A JavaScript library for building user interfaces out of reusable components.
+- **React** – A JavaScript library for building user interfaces out of reusable components (written in JSX).
+- **Vite** – The build tool and dev server that converts and bundles our React code and hot-reloads the browser as we edit.
+- **React Router** – Handles navigation between pages without reloading the browser.
+- **MUI DataGrid** – A ready-made table with sorting, filtering and pagination.
 - **Material UI (MUI)** – A library of pre-built, good-looking React components (buttons, tables, forms) so we don't design everything from scratch.
-- **Node.js** – Runs JavaScript tooling (dev server, package installs) on your computer.
+- **Node.js and npm** – Node runs JavaScript tooling (dev server) on your computer; npm installs frontend packages (like `pip` for Python).
 
 ### Tooling
 
@@ -92,6 +95,15 @@ cashcow/
 ├── .gitignore             # Files Git should not track
 ├── README.md              # One-paragraph project summary
 ├── BUILD_NOTES.md         # This document
+├── frontend/
+│   ├── package.json       # Dependencies and scripts (like requirements.txt)
+│   ├── index.html         # The single page the React app loads into
+│   ├── .env               # API address (NOT committed to git)
+│   ├── .env.example       # Template, safe to commit
+│   └── src/
+│       ├── main.jsx       # Starts React, applies the theme
+│       ├── theme.js       # Colors/fonts/spacing for all MUI components
+│       └── App.jsx        # Root component
 └── backend/
     ├── requirements.txt   # Exact list of Python packages + versions
     ├── .env               # Real settings (NOT committed to git)
@@ -436,6 +448,7 @@ Read `A ──< B` as "one A has many B". For example, one branch has many ATMs,
 
 - **PATCH** – An HTTP request that updates only the fields you send (unlike replacing the whole record).
 - **Primary key** (`primary_key=True`) – the column that uniquely identifies each row. SQLAlchemy makes an integer `id` that counts up automatically.
+- **Component** – In React, a function that returns JSX describing part of the page.
 - **Foreign key** (`ForeignKey("branches.id")`) – a column that stores the `id` of a row in another table. This is how tables are linked, and the database refuses a value that doesn't exist in the other table.
 - **`relationship()`** – a Python-side shortcut that lets you write `atm.branch` or `branch.atms` instead of running a lookup yourself. It creates no column. `back_populates` links the two sides so they stay in sync.
 - **`Mapped[int | None]`** – a type hint that also sets nullability. `Mapped[int]` means the column is required; `Mapped[int | None]` means it may be empty (`NULL`).
@@ -1588,6 +1601,171 @@ python -m app.create_user admin@cashcow.com "Admin User"
 
 ---
 
+### Step 13 ✅ — Scaffold the frontend (Vite + React + Material UI)
+
+**Why:** The API works, but nobody wants to use it through a `/docs` page. The frontend is the real user interface. This step creates the project, installs the UI libraries, and proves the whole chain works: React renders a page, Material UI styles it, and the browser can call our backend.
+
+**Concepts:**
+
+- **Vite** – a build tool and development server. Browsers only understand plain HTML, CSS and JavaScript, but React code is written in **JSX** (HTML-like tags inside JavaScript) and split across many files and packages. Vite converts and bundles everything. `npm run dev` starts a local server that **hot-reloads** the browser whenever you save a file (like `--reload` on our backend). `npm run build` produces optimized static files for deployment.
+- **JSX** – the HTML-like syntax React uses to describe what's on screen, such as `<Button>Save</Button>`, written inside JavaScript. Files that contain it end in `.jsx`.
+- **JavaScript vs TypeScript** – we chose plain JavaScript (the `react` template). TypeScript adds type declarations that catch mistakes before you run the code; it is optional, and JSX works with both.
+- **npm** – Node's package installer, the frontend equivalent of `pip`. Packages are listed in `package.json` (like `requirements.txt`) and downloaded into `node_modules/` (like `.venv`; regenerated, never committed).
+- **React component** – a function that returns JSX. Components nest inside each other to build a page.
+- **Hooks** – `useState` makes a component remember data and re-render when it changes; `useEffect` runs code after the component appears (such as calling the API).
+- **Environment variables in Vite** – only variables starting with `VITE_` are exposed to browser code, read as `import.meta.env.VITE_NAME`. Anything in browser code is visible to every user, so **never put secrets in these**.
+
+**13a. Create the Vite project.** From the project root (not `backend/`):
+
+```bash
+npm create vite@latest frontend -- --template react
+cd frontend
+npm install
+```
+
+- `npm create vite@latest` downloads and runs Vite's project generator.
+- `frontend` is the folder name; `--template react` picks plain JavaScript React.
+- If it asks about optional extras or "install and start now?", accept defaults for extras and choose **No** to starting now.
+- `npm install` downloads everything listed in `package.json`.
+
+Vite generates: `package.json` (dependencies and scripts), `index.html` (the single page the whole app loads into), `src/main.jsx` (starts React), and `vite.config.js` (Vite settings, unchanged by us).
+
+**13b. Install the UI packages:**
+
+```bash
+npm install @mui/material @emotion/react @emotion/styled @mui/icons-material @mui/x-data-grid react-router
+```
+
+| Package | Why |
+|---|---|
+| `@mui/material` | Core Material UI components: `Grid`, `Box`, `Card`, `Container`, buttons, etc. |
+| `@emotion/react`, `@emotion/styled` | The styling engine MUI uses internally; MUI requires them |
+| `@mui/icons-material` | Icon set for menus, status badges and buttons |
+| `@mui/x-data-grid` | The DataGrid table with sorting, filtering and pagination |
+| `react-router` | Navigation between pages (login, dashboard, ATMs, service calls) |
+
+**13c. Remove the starter demo files:**
+
+```bash
+rm src/App.css src/index.css
+rm -r src/assets
+```
+
+**13d. Add the API address.** Create `frontend/.env`:
+
+```
+VITE_API_URL=http://127.0.0.1:8000
+```
+
+Also create `frontend/.env.example` with the same line, to commit as a template. The root `.gitignore` already ignores `.env` files. Keeping the API address in one place means pointing at a deployed backend later needs no code change.
+
+**13e. Theme and entry point.** The theme is one central place for colors, fonts and spacing:
+
+**`frontend/src/theme.js`**
+
+```js
+import { createTheme } from '@mui/material/styles'
+
+// One central place for colors, fonts, and spacing across the whole app
+const theme = createTheme({
+  palette: {
+    primary: { main: '#1b5e20' },
+  },
+})
+
+export default theme
+```
+
+Replace `src/main.jsx`. `ThemeProvider` makes our theme available to every MUI component, and `CssBaseline` resets inconsistent browser default styles so the page looks the same everywhere:
+
+**`frontend/src/main.jsx`**
+
+```jsx
+import { StrictMode } from 'react'
+import { createRoot } from 'react-dom/client'
+import { CssBaseline, ThemeProvider } from '@mui/material'
+
+import App from './App.jsx'
+import theme from './theme.js'
+
+createRoot(document.getElementById('root')).render(
+  <StrictMode>
+    <ThemeProvider theme={theme}>
+      <CssBaseline />
+      <App />
+    </ThemeProvider>
+  </StrictMode>,
+)
+```
+
+**13f. A temporary test page** (`src/App.jsx`). It calls the backend's `/health` endpoint and shows the result, which proves React, MUI, the `.env` value and the browser-to-API connection all work:
+
+**`frontend/src/App.jsx`**
+
+```jsx
+import { useEffect, useState } from 'react'
+import { Box, Card, CardContent, Chip, Container, Typography } from '@mui/material'
+
+const API_URL = import.meta.env.VITE_API_URL
+
+export default function App() {
+  const [status, setStatus] = useState('checking...')
+
+  useEffect(() => {
+    fetch(`${API_URL}/health`)
+      .then((response) => response.json())
+      .then((data) => setStatus(data.status))
+      .catch(() => setStatus('unreachable'))
+  }, [])
+
+  return (
+    <Container maxWidth="sm">
+      <Box sx={{ mt: 8 }}>
+        <Card>
+          <CardContent>
+            <Typography variant="h4" gutterBottom>
+              CashCow
+            </Typography>
+            <Typography sx={{ mb: 2 }}>Backend API status:</Typography>
+            <Chip
+              label={status}
+              color={status === 'ok' ? 'success' : 'error'}
+            />
+          </CardContent>
+        </Card>
+      </Box>
+    </Container>
+  )
+}
+```
+
+Notes on the code: `Container` centers content and limits its width, `Box` is a general-purpose wrapper, and `Card`/`CardContent` draw a card. The `sx` prop is MUI's shortcut for styling (`mt: 8` is a top margin of 8 spacing units). The `[]` at the end of `useEffect` means "run once, when the component first appears".
+
+Optionally change the `<title>` in `frontend/index.html` to `CashCow`; this is the text shown on the browser tab.
+
+**13g. Run both servers** (two terminals):
+
+```bash
+# Terminal 1: backend, from backend/ with the venv active
+uvicorn app.main:app --reload
+```
+
+```bash
+# Terminal 2: frontend
+cd frontend
+npm run dev
+```
+
+Vite prints an address, usually `http://localhost:5173`. Open it.
+
+**Expected:** a card titled "CashCow" with a **green** chip saying `ok`.
+
+**If the chip is red and says `unreachable`:**
+- Check the backend is running.
+- Open the frontend at exactly `http://localhost:5173`. The backend's CORS setting (from Step 12) only allows that origin, so `http://127.0.0.1:5173` would be blocked.
+
+---
+
 ---
 
 ## 6. Roadmap
@@ -1603,7 +1781,7 @@ Planned steps. Each becomes a numbered step above once built.
 - [x] Schemas and routes for technicians, ATMs, service calls, and reports
 - [x] Authentication (bcrypt password hashing + JWT login) — backend done; frontend login comes with the React app
 - [ ] Simulation logic (ATM cash levels, service dispatch)
-- [ ] Frontend: React + Material UI project setup
+- [x] Frontend: React + Material UI project setup
 - [ ] Connect frontend to backend (API calls, CORS)
 - [ ] Tests
 - [ ] Deployment notes
@@ -1620,6 +1798,7 @@ Planned steps. Each becomes a numbered step above once built.
 - **Enum** – A type limited to a fixed list of named values.
 - **Salt** – Random data mixed into a password before hashing so identical passwords produce different hashes.
 - **Hash** – A one-way scramble of data (used for passwords); you can check a match but can't reverse it.
+- **Hook** – A React function like `useState` or `useEffect` that gives a component memory or side effects.
 - **JWT** – A signed token proving who a user is, sent with each request.
 - **Migration** – A versioned script that changes the database structure. Alembic runs them in order, so every copy of the database ends up identical.
 - **PATCH** – An HTTP request that updates only the fields you send (unlike replacing the whole record).
