@@ -105,9 +105,18 @@ cashcow/
         ├── config.py      # Loads settings from .env
         ├── database.py    # SQLAlchemy engine, session factory, get_db dependency
         ├── routers/       # URL handlers, one file per resource
-        │   └── branches.py
+        │   ├── utils.py   # get_or_404 helper
+        │   ├── branches.py
+        │   ├── technicians.py
+        │   ├── atms.py
+        │   ├── service_calls.py
+        │   └── reports.py
         ├── schemas/       # Pydantic request/response shapes
-        │   └── branch.py
+        │   ├── branch.py
+        │   ├── technician.py
+        │   ├── atm.py
+        │   ├── service_call.py
+        │   └── report.py
         └── models/
             ├── __init__.py      # Imports every model (Alembic needs this)
             ├── base.py          # SQLAlchemy Base class all table models inherit from
@@ -418,6 +427,7 @@ Read `A ──< B` as "one A has many B". For example, one branch has many ATMs,
 
 **Concepts used in the code:**
 
+- **PATCH** – An HTTP request that updates only the fields you send (unlike replacing the whole record).
 - **Primary key** (`primary_key=True`) – the column that uniquely identifies each row. SQLAlchemy makes an integer `id` that counts up automatically.
 - **Foreign key** (`ForeignKey("branches.id")`) – a column that stores the `id` of a row in another table. This is how tables are linked, and the database refuses a value that doesn't exist in the other table.
 - **`relationship()`** – a Python-side shortcut that lets you write `atm.branch` or `branch.atms` instead of running a lookup yourself. It creates no column. `back_populates` links the two sides so they stay in sync.
@@ -847,6 +857,365 @@ You should see `Uvicorn running on http://127.0.0.1:8000`.
 
 ---
 
+### Step 11 ✅ — Add the remaining resources: technicians, ATMs, service calls, reports
+
+**Why:** Branches proved the pattern works. Now we repeat it for the other four entities so the API covers the whole data model. The pattern for each is the same: a schema file (what JSON looks like), a router file (the URLs), and one line in `main.py` to register it. A few new ideas appear along the way.
+
+**What's new compared with Branch:**
+
+- **Existence checks.** Creating a technician, ATM, service call or report first confirms that the record it points to exists (the branch, ATM, technician or service call), and returns a clear `404` such as "Branch not found" instead of a raw database error. A small shared helper, `get_or_404`, does this lookup.
+- **`PATCH` for partial updates.** A `PATCH` request changes only the fields you send. We read the request with `model_dump(exclude_unset=True)`, which separates "the client didn't send this field" from "the client sent `null`". That is what lets you unassign a technician by sending `"technician_id": null`, while an omitted field is left alone.
+- **`409 Conflict`.** An ATM's `serial_number` must be unique. If someone submits a duplicate, the database raises an `IntegrityError`; we catch it, undo the failed save with `db.rollback()`, and return a friendly `409`.
+- **Rules built into the schemas.** New service calls always start as `Pending` (the create schema has no `status` field). ATM `cash_level` cannot be negative. An ATM's `serial_number` cannot be changed after creation (it is absent from the update schema).
+- **Decimals as strings.** `cash_level` appears in JSON as `"5000.00"`. Pydantic does this with `Decimal` values to avoid rounding errors.
+
+Create or change the files below, all inside `backend/app/`.
+
+**11a. Shared helper**
+
+**`routers/utils.py`**
+
+```python
+from fastapi import HTTPException
+from sqlalchemy.orm import Session
+
+
+def get_or_404(db: Session, model, obj_id: int, label: str):
+    obj = db.get(model, obj_id)
+    if obj is None:
+        raise HTTPException(status_code=404, detail=f"{label} not found")
+    return obj
+```
+
+**11b. Schemas** (in `schemas/`)
+
+**`schemas/technician.py`**
+
+```python
+from pydantic import BaseModel, ConfigDict, Field
+
+
+class TechnicianCreate(BaseModel):
+    name: str = Field(min_length=1, max_length=100)
+    branch_id: int
+
+
+class TechnicianRead(TechnicianCreate):
+    id: int
+
+    model_config = ConfigDict(from_attributes=True)
+```
+
+**`schemas/atm.py`**
+
+```python
+from decimal import Decimal
+
+from pydantic import BaseModel, ConfigDict, Field
+
+from app.models.enums import ATMStatus
+
+
+class ATMCreate(BaseModel):
+    serial_number: str = Field(min_length=1, max_length=50)
+    model: str = Field(min_length=1, max_length=100)
+    status: ATMStatus = ATMStatus.OPERATIONAL
+    cash_level: Decimal = Field(default=Decimal("0"), ge=0, max_digits=12, decimal_places=2)
+    branch_id: int
+
+
+class ATMUpdate(BaseModel):
+    model: str | None = Field(default=None, min_length=1, max_length=100)
+    status: ATMStatus | None = None
+    cash_level: Decimal | None = Field(default=None, ge=0, max_digits=12, decimal_places=2)
+
+
+class ATMRead(ATMCreate):
+    id: int
+
+    model_config = ConfigDict(from_attributes=True)
+```
+
+**`schemas/service_call.py`**
+
+```python
+from pydantic import BaseModel, ConfigDict, Field
+
+from app.models.enums import ServicePriority, ServiceStatus
+
+
+class ServiceCallCreate(BaseModel):
+    title: str = Field(min_length=1, max_length=200)
+    priority: ServicePriority = ServicePriority.MEDIUM
+    atm_id: int
+    technician_id: int | None = None
+
+
+class ServiceCallUpdate(BaseModel):
+    title: str | None = Field(default=None, min_length=1, max_length=200)
+    priority: ServicePriority | None = None
+    status: ServiceStatus | None = None
+    technician_id: int | None = None
+
+
+class ServiceCallRead(ServiceCallCreate):
+    id: int
+    status: ServiceStatus
+
+    model_config = ConfigDict(from_attributes=True)
+```
+
+**`schemas/report.py`**
+
+```python
+from datetime import datetime
+
+from pydantic import BaseModel, ConfigDict, Field
+
+
+class ReportCreate(BaseModel):
+    file_url: str = Field(min_length=1, max_length=500)
+    notes: str | None = None
+    service_call_id: int
+
+
+class ReportRead(ReportCreate):
+    id: int
+    timestamp: datetime
+
+    model_config = ConfigDict(from_attributes=True)
+```
+
+**11c. Routers** (in `routers/`)
+
+**`routers/technicians.py`**
+
+```python
+from fastapi import APIRouter, Depends, status
+from sqlalchemy import select
+from sqlalchemy.orm import Session
+
+from app.database import get_db
+from app.models import Branch, Technician
+from app.routers.utils import get_or_404
+from app.schemas.technician import TechnicianCreate, TechnicianRead
+
+router = APIRouter(prefix="/technicians", tags=["technicians"])
+
+
+@router.post("", response_model=TechnicianRead, status_code=status.HTTP_201_CREATED)
+def create_technician(data: TechnicianCreate, db: Session = Depends(get_db)):
+    get_or_404(db, Branch, data.branch_id, "Branch")
+    technician = Technician(**data.model_dump())
+    db.add(technician)
+    db.commit()
+    db.refresh(technician)
+    return technician
+
+
+@router.get("", response_model=list[TechnicianRead])
+def list_technicians(db: Session = Depends(get_db)):
+    return db.scalars(select(Technician).order_by(Technician.id)).all()
+
+
+@router.get("/{technician_id}", response_model=TechnicianRead)
+def get_technician(technician_id: int, db: Session = Depends(get_db)):
+    return get_or_404(db, Technician, technician_id, "Technician")
+```
+
+**`routers/atms.py`**
+
+```python
+from fastapi import APIRouter, Depends, HTTPException, status
+from sqlalchemy import select
+from sqlalchemy.exc import IntegrityError
+from sqlalchemy.orm import Session
+
+from app.database import get_db
+from app.models import ATM, Branch
+from app.routers.utils import get_or_404
+from app.schemas.atm import ATMCreate, ATMRead, ATMUpdate
+
+router = APIRouter(prefix="/atms", tags=["atms"])
+
+
+@router.post("", response_model=ATMRead, status_code=status.HTTP_201_CREATED)
+def create_atm(data: ATMCreate, db: Session = Depends(get_db)):
+    get_or_404(db, Branch, data.branch_id, "Branch")
+    atm = ATM(**data.model_dump())
+    db.add(atm)
+    try:
+        db.commit()
+    except IntegrityError:
+        db.rollback()
+        raise HTTPException(
+            status_code=409, detail="An ATM with that serial number already exists"
+        )
+    db.refresh(atm)
+    return atm
+
+
+@router.get("", response_model=list[ATMRead])
+def list_atms(db: Session = Depends(get_db)):
+    return db.scalars(select(ATM).order_by(ATM.id)).all()
+
+
+@router.get("/{atm_id}", response_model=ATMRead)
+def get_atm(atm_id: int, db: Session = Depends(get_db)):
+    return get_or_404(db, ATM, atm_id, "ATM")
+
+
+@router.patch("/{atm_id}", response_model=ATMRead)
+def update_atm(atm_id: int, data: ATMUpdate, db: Session = Depends(get_db)):
+    atm = get_or_404(db, ATM, atm_id, "ATM")
+    # Only fields the client sent; explicit nulls are ignored (no ATM column is optional)
+    changes = data.model_dump(exclude_unset=True, exclude_none=True)
+    for field, value in changes.items():
+        setattr(atm, field, value)
+    db.commit()
+    db.refresh(atm)
+    return atm
+```
+
+**`routers/service_calls.py`**
+
+```python
+from fastapi import APIRouter, Depends, status
+from sqlalchemy import select
+from sqlalchemy.orm import Session
+
+from app.database import get_db
+from app.models import ATM, ServiceCall, Technician
+from app.routers.utils import get_or_404
+from app.schemas.service_call import ServiceCallCreate, ServiceCallRead, ServiceCallUpdate
+
+router = APIRouter(prefix="/service-calls", tags=["service calls"])
+
+
+@router.post("", response_model=ServiceCallRead, status_code=status.HTTP_201_CREATED)
+def create_service_call(data: ServiceCallCreate, db: Session = Depends(get_db)):
+    get_or_404(db, ATM, data.atm_id, "ATM")
+    if data.technician_id is not None:
+        get_or_404(db, Technician, data.technician_id, "Technician")
+    service_call = ServiceCall(**data.model_dump())
+    db.add(service_call)
+    db.commit()
+    db.refresh(service_call)
+    return service_call
+
+
+@router.get("", response_model=list[ServiceCallRead])
+def list_service_calls(db: Session = Depends(get_db)):
+    return db.scalars(select(ServiceCall).order_by(ServiceCall.id)).all()
+
+
+@router.get("/{service_call_id}", response_model=ServiceCallRead)
+def get_service_call(service_call_id: int, db: Session = Depends(get_db)):
+    return get_or_404(db, ServiceCall, service_call_id, "Service call")
+
+
+@router.patch("/{service_call_id}", response_model=ServiceCallRead)
+def update_service_call(
+    service_call_id: int, data: ServiceCallUpdate, db: Session = Depends(get_db)
+):
+    service_call = get_or_404(db, ServiceCall, service_call_id, "Service call")
+    # Only fields the client sent. technician_id may be null (unassign); the rest may not.
+    changes = {
+        field: value
+        for field, value in data.model_dump(exclude_unset=True).items()
+        if value is not None or field == "technician_id"
+    }
+    if changes.get("technician_id") is not None:
+        get_or_404(db, Technician, changes["technician_id"], "Technician")
+    for field, value in changes.items():
+        setattr(service_call, field, value)
+    db.commit()
+    db.refresh(service_call)
+    return service_call
+```
+
+**`routers/reports.py`**
+
+```python
+from fastapi import APIRouter, Depends, status
+from sqlalchemy import select
+from sqlalchemy.orm import Session
+
+from app.database import get_db
+from app.models import Report, ServiceCall
+from app.routers.utils import get_or_404
+from app.schemas.report import ReportCreate, ReportRead
+
+router = APIRouter(prefix="/reports", tags=["reports"])
+
+
+@router.post("", response_model=ReportRead, status_code=status.HTTP_201_CREATED)
+def create_report(data: ReportCreate, db: Session = Depends(get_db)):
+    get_or_404(db, ServiceCall, data.service_call_id, "Service call")
+    report = Report(**data.model_dump())
+    db.add(report)
+    db.commit()
+    db.refresh(report)
+    return report
+
+
+@router.get("", response_model=list[ReportRead])
+def list_reports(db: Session = Depends(get_db)):
+    return db.scalars(select(Report).order_by(Report.id)).all()
+
+
+@router.get("/{report_id}", response_model=ReportRead)
+def get_report(report_id: int, db: Session = Depends(get_db)):
+    return get_or_404(db, Report, report_id, "Report")
+```
+
+**11d. Register the routers.** Replace `main.py` with:
+
+**`main.py`**
+
+```python
+from fastapi import FastAPI
+
+from app.routers import atms, branches, reports, service_calls, technicians
+
+app = FastAPI(title="CashCow API")
+
+app.include_router(branches.router)
+app.include_router(technicians.router)
+app.include_router(atms.router)
+app.include_router(service_calls.router)
+app.include_router(reports.router)
+
+@app.get("/health", tags=["health"])
+def health():
+    return {"status": "ok"}
+```
+
+**11e. Run and test.** From inside `backend/`, with the virtual environment active and PostgreSQL running:
+
+```bash
+uvicorn app.main:app --reload
+```
+
+Open **http://127.0.0.1:8000/docs**. You should see six groups (branches, technicians, atms, service calls, reports, health). Test in this order, because each item depends on the one before (the examples assume a branch with `id` 1 already exists from Step 10):
+
+1. **POST /technicians** `{"name": "Alex Rivera", "branch_id": 1}` → `201`.
+2. **POST /atms** `{"serial_number": "ATM-0001", "model": "NCR SelfServ", "cash_level": "5000.00", "branch_id": 1}` → `201`; status defaults to `Operational`.
+3. **POST /service-calls** `{"title": "Card reader jammed", "priority": "Critical", "atm_id": 1}` → `201`; status is `Pending` and `technician_id` is `null`.
+4. **PATCH /service-calls/1** `{"technician_id": 1, "status": "In-Progress"}` → the call is assigned. Then send `{"technician_id": null}` to confirm it unassigns.
+5. **PATCH /atms/1** `{"status": "Maintenance"}` → only the status changes.
+6. **POST /reports** `{"file_url": "https://example.com/report1.pdf", "notes": "Replaced reader", "service_call_id": 1}` → `201`, with a `timestamp` filled in by the database.
+
+Then try the error cases:
+
+| Request | Expected |
+|---|---|
+| POST a technician with `"branch_id": 999` | `404` "Branch not found" |
+| POST the same ATM `serial_number` twice | `409` conflict message |
+| PATCH an ATM with `"status": "Banana"` | `422` validation error listing the allowed values |
+
+---
+
 ---
 
 ## 6. Roadmap
@@ -859,7 +1228,7 @@ Planned steps. Each becomes a numbered step above once built.
 - [x] Alembic setup and first migration
 - [x] Pydantic schemas (request/response shapes) — Branch done
 - [x] FastAPI app entry point (`main.py`) and first routes — Branch done
-- [ ] Schemas and routes for technicians, ATMs, service calls, and reports
+- [x] Schemas and routes for technicians, ATMs, service calls, and reports
 - [ ] Authentication (bcrypt password hashing + JWT login)
 - [ ] Simulation logic (ATM cash levels, service dispatch)
 - [ ] Frontend: React + Material UI project setup
@@ -879,6 +1248,7 @@ Planned steps. Each becomes a numbered step above once built.
 - **Hash** – A one-way scramble of data (used for passwords); you can check a match but can't reverse it.
 - **JWT** – A signed token proving who a user is, sent with each request.
 - **Migration** – A versioned script that changes the database structure. Alembic runs them in order, so every copy of the database ends up identical.
+- **PATCH** – An HTTP request that updates only the fields you send (unlike replacing the whole record).
 - **Primary key** – The column that uniquely identifies each row in a table.
 - **ORM** – Lets you work with database rows as Python objects.
 - **Router** – A group of related URLs in FastAPI, kept in its own file.
