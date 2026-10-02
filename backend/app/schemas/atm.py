@@ -21,5 +21,6 @@ class ATMUpdate(BaseModel):
 
 class ATMRead(ATMCreate):
     id: int
+    branch_name: str
 
     model_config = ConfigDict(from_attributes=True)

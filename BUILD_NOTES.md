@@ -107,9 +107,16 @@ cashcow/
 │       ├── api.js         # apiFetch: attaches token, handles errors/401
 │       ├── AuthContext.jsx # Login state shared across the app (useAuth hook)
 │       ├── ProtectedRoute.jsx # Redirects logged-out users to /login
+│       ├── format.js      # Currency and percent formatting
+│       ├── hooks/
+│       │   └── useApi.js  # Load data from the API (loading/error/reload)
+│       ├── components/
+│       │   ├── Layout.jsx     # Top bar + navigation around every logged-in page
+│       │   ├── StatCard.jsx   # One headline number
+│       │   └── StatusChip.jsx # Colored status/priority badge
 │       └── pages/
 │           ├── LoginPage.jsx
-│           └── HomePage.jsx   # Placeholder until the dashboard
+│           └── DashboardPage.jsx
 └── backend/
     ├── requirements.txt   # Exact list of Python packages + versions
     ├── .env               # Real settings (NOT committed to git)
@@ -460,6 +467,7 @@ Read `A ──< B` as "one A has many B". For example, one branch has many ATMs,
 - **Alias (SQL)** – A second name for the same table within one query, so it can be joined to itself or used twice.
 - **Check constraint** – A rule the database itself enforces on a column (for example, "exactly 5 digits"), even if the API is bypassed.
 - **Primary key** (`primary_key=True`) – the column that uniquely identifies each row. SQLAlchemy makes an integer `id` that counts up automatically.
+- **Props** – Inputs passed to a React component, like function arguments.
 - **Context** – A React feature that shares a value (like the logged-in user) with every component below a provider, without passing props through each layer.
 - **Component** – In React, a function that returns JSX describing part of the page.
 - **Foreign key** (`ForeignKey("branches.id")`) – a column that stores the `id` of a row in another table. This is how tables are linked, and the database refuses a value that doesn't exist in the other table.
@@ -2938,6 +2946,605 @@ Try the metrics responding to changes: `PATCH /atms/4` with `{"status": "Mainten
 
 ---
 
+### Step 17 ✅ — Build the app layout and dashboard
+
+**Why:** The metrics API returns the answers; this step puts them on screen. We add a shared layout (top bar and navigation) that every logged-in page uses, and a dashboard page that shows the headline numbers, status badges, alerts and reports from a single call to `GET /metrics/dashboard`. The dashboard loads when the page opens, and a **Refresh** button reloads it on demand (no automatic polling for now; that is easy to add later if the data starts changing over time).
+
+**Concepts:**
+
+- **Props.** Components receive inputs as props, like `<StatCard label="Total ATMs" value={20} />`, so one component can be reused with different data.
+- **Rendering lists.** `array.map(item => <Thing key={item.id} />)` turns data into elements. The `key` lets React track which item is which.
+- **Conditional rendering.** `{condition && <Alert />}` shows the element only when the condition is true. That is how alerts appear only when they apply.
+- **MUI `Grid`.** `<Grid container>` holds the layout and each `<Grid size={{ xs: 12, md: 6 }}>` is a column. The numbers are out of 12 and change per screen size: `xs` is phones and `md` is medium screens and up, so cards stack on a phone and sit side by side on a laptop.
+- **Custom hook.** `useApi` packages "load data, track loading and errors, allow reload" so every page can reuse it.
+- **Layout route.** `<Route element={<Layout />}>` wraps its child pages with the top bar. `<Outlet />` inside `Layout` is where each page appears.
+- **StrictMode in development.** In dev you'll see two `/metrics/dashboard` requests on first load. React deliberately runs effects twice to catch bugs. It doesn't happen in a production build. The `ignore` flag in `useApi` makes sure only the latest request's result is used.
+
+**17a. Helpers.** Money arrives from the API as text such as `"800.00"`, so `formatCurrency` converts it to a number before formatting. `formatPercent` handles the `null` the API sends when a model has no finished service calls.
+
+**`frontend/src/format.js`**
+
+```js
+const currency = new Intl.NumberFormat('en-US', { style: 'currency', currency: 'USD' })
+
+// The API sends money as text such as "1200.00", so convert it to a number first
+export const formatCurrency = (amount) => currency.format(Number(amount))
+
+export const formatPercent = (value) => (value === null ? 'No data' : `${value}%`)
+```
+
+The `useApi` hook loads data when a component first appears and offers a `reload()` function. Its `loading` flag lets the page show a spinner, and `error` holds a readable message if the request fails:
+
+**`frontend/src/hooks/useApi.js`**
+
+```js
+import { useCallback, useEffect, useState } from 'react'
+
+import { apiFetch } from '../api.js'
+
+// Loads data from the API when the component first appears, and offers reload()
+export function useApi(path) {
+  const [data, setData] = useState(null)
+  const [loading, setLoading] = useState(true)
+  const [error, setError] = useState('')
+  const [reloadCount, setReloadCount] = useState(0)
+
+  useEffect(() => {
+    // If the component goes away (or a newer request starts), ignore this request's result
+    let ignore = false
+    apiFetch(path)
+      .then((result) => {
+        if (ignore) return
+        setData(result)
+        setError('')
+      })
+      .catch((err) => {
+        if (!ignore) setError(err.message)
+      })
+      .finally(() => {
+        if (!ignore) setLoading(false)
+      })
+    return () => {
+      ignore = true
+    }
+  }, [path, reloadCount])
+
+  const reload = useCallback(() => {
+    setLoading(true)
+    setReloadCount((count) => count + 1)
+  }, [])
+
+  return { data, loading, error, reload }
+}
+```
+
+**17b. Reusable components** (create the `components` folder). `StatCard` is one headline number; `StatusChip` is a colored badge whose color comes from a lookup table of statuses and priorities. It already knows the service call priorities, so we'll reuse it for the data grid pages.
+
+**`frontend/src/components/StatCard.jsx`**
+
+```jsx
+import { Card, CardContent, Typography } from '@mui/material'
+
+export default function StatCard({ label, value, color = 'text.primary' }) {
+  return (
+    <Card sx={{ height: '100%' }}>
+      <CardContent>
+        <Typography color="text.secondary" gutterBottom>
+          {label}
+        </Typography>
+        <Typography variant="h3" sx={{ color }}>
+          {value}
+        </Typography>
+      </CardContent>
+    </Card>
+  )
+}
+```
+
+**`frontend/src/components/StatusChip.jsx`**
+
+```jsx
+import { Chip } from '@mui/material'
+
+// Which MUI color each status or priority gets
+const COLORS = {
+  Operational: 'success',
+  'In-Transport': 'info',
+  Maintenance: 'warning',
+  Offline: 'error',
+  Pending: 'default',
+  'In-Progress': 'info',
+  Completed: 'success',
+  Failed: 'error',
+  Low: 'default',
+  Medium: 'warning',
+  Critical: 'error',
+}
+
+export default function StatusChip({ status, count }) {
+  const label = count === undefined ? status : `${status}: ${count}`
+  return <Chip label={label} color={COLORS[status] ?? 'default'} size="small" />
+}
+```
+
+**17c. The layout.** `component={NavLink}` makes an MUI button behave as a router link, and React Router automatically adds an `active` class to the link for the current page, which the `sx` rule highlights. `end` stops `/` from counting as "active" on every page. Navigation lists only the Dashboard for now; we add entries to `NAV_ITEMS` as new pages are built, so there are never dead links.
+
+**`frontend/src/components/Layout.jsx`**
+
+```jsx
+import { AppBar, Box, Button, Container, Toolbar, Typography } from '@mui/material'
+import { NavLink, Outlet } from 'react-router'
+
+import { useAuth } from '../AuthContext.jsx'
+
+// Add an entry here whenever we build a new page
+const NAV_ITEMS = [{ label: 'Dashboard', to: '/' }]
+
+export default function Layout() {
+  const { user, logout } = useAuth()
+
+  return (
+    <Box sx={{ minHeight: '100vh', bgcolor: 'grey.100' }}>
+      <AppBar position="static">
+        <Toolbar>
+          <Typography variant="h6" sx={{ mr: 4 }}>
+            CashCow
+          </Typography>
+          <Box sx={{ flexGrow: 1, display: 'flex', gap: 1 }}>
+            {NAV_ITEMS.map((item) => (
+              <Button
+                key={item.to}
+                color="inherit"
+                component={NavLink}
+                to={item.to}
+                end
+                sx={{ '&.active': { bgcolor: 'rgba(255, 255, 255, 0.18)' } }}
+              >
+                {item.label}
+              </Button>
+            ))}
+          </Box>
+          <Typography variant="body2" sx={{ mr: 2 }}>
+            {user.full_name}
+          </Typography>
+          <Button color="inherit" onClick={logout}>
+            Log out
+          </Button>
+        </Toolbar>
+      </AppBar>
+      <Container maxWidth="lg" sx={{ py: 4 }}>
+        <Outlet />
+      </Container>
+    </Box>
+  )
+}
+```
+
+**17d. The dashboard page.** The spinner shows only on the first load (`loading && !data`). On a later Refresh the old data stays visible while the new data loads, so the page doesn't flash empty. Errors appear above the content.
+
+**`frontend/src/pages/DashboardPage.jsx`**
+
+```jsx
+import RefreshIcon from '@mui/icons-material/Refresh'
+import {
+  Alert,
+  AlertTitle,
+  Box,
+  Button,
+  Card,
+  CardContent,
+  CircularProgress,
+  Grid,
+  List,
+  ListItem,
+  ListItemText,
+  Table,
+  TableBody,
+  TableCell,
+  TableHead,
+  TableRow,
+  Typography,
+} from '@mui/material'
+
+import StatCard from '../components/StatCard.jsx'
+import StatusChip from '../components/StatusChip.jsx'
+import { formatCurrency, formatPercent } from '../format.js'
+import { useApi } from '../hooks/useApi.js'
+
+export default function DashboardPage() {
+  const { data, loading, error, reload } = useApi('/metrics/dashboard')
+
+  return (
+    <Box>
+      <Box sx={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', mb: 3 }}>
+        <Typography variant="h4">Dashboard</Typography>
+        <Button variant="outlined" startIcon={<RefreshIcon />} onClick={reload} disabled={loading}>
+          Refresh
+        </Button>
+      </Box>
+
+      {error && (
+        <Alert severity="error" sx={{ mb: 3 }}>
+          {error}
+        </Alert>
+      )}
+      {loading && !data && (
+        <Box sx={{ display: 'flex', justifyContent: 'center', mt: 8 }}>
+          <CircularProgress />
+        </Box>
+      )}
+      {data && <DashboardContent data={data} />}
+    </Box>
+  )
+}
+
+function DashboardContent({ data }) {
+  const {
+    summary,
+    low_cash,
+    technician_mismatches,
+    completion_by_model,
+    maintenance_alerts,
+    technicians_by_supervisor,
+  } = data
+
+  const hasAlerts =
+    low_cash.total > 0 || technician_mismatches.length > 0 || maintenance_alerts.length > 0
+
+  return (
+    <Grid container spacing={3}>
+      {/* Headline numbers */}
+      <Grid size={{ xs: 12, sm: 6, md: 3 }}>
+        <StatCard label="Total ATMs" value={summary.total_atms} />
+      </Grid>
+      <Grid size={{ xs: 12, sm: 6, md: 3 }}>
+        <StatCard label="Open service calls" value={summary.open_service_calls} />
+      </Grid>
+      <Grid size={{ xs: 12, sm: 6, md: 3 }}>
+        <StatCard
+          label="Critical open calls"
+          value={summary.critical_open_service_calls}
+          color={summary.critical_open_service_calls > 0 ? 'error.main' : undefined}
+        />
+      </Grid>
+      <Grid size={{ xs: 12, sm: 6, md: 3 }}>
+        <StatCard
+          label="Low-cash ATMs"
+          value={low_cash.total}
+          color={low_cash.total > 0 ? 'warning.main' : undefined}
+        />
+      </Grid>
+
+      {/* Status badges */}
+      <Grid size={{ xs: 12, md: 6 }}>
+        <Card sx={{ height: '100%' }}>
+          <CardContent>
+            <Typography variant="h6" gutterBottom>
+              ATMs by status
+            </Typography>
+            <Box sx={{ display: 'flex', flexWrap: 'wrap', gap: 1 }}>
+              {Object.entries(summary.atms_by_status).map(([status, count]) => (
+                <StatusChip key={status} status={status} count={count} />
+              ))}
+            </Box>
+          </CardContent>
+        </Card>
+      </Grid>
+      <Grid size={{ xs: 12, md: 6 }}>
+        <Card sx={{ height: '100%' }}>
+          <CardContent>
+            <Typography variant="h6" gutterBottom>
+              Service calls by status
+            </Typography>
+            <Box sx={{ display: 'flex', flexWrap: 'wrap', gap: 1 }}>
+              {Object.entries(summary.service_calls_by_status).map(([status, count]) => (
+                <StatusChip key={status} status={status} count={count} />
+              ))}
+            </Box>
+          </CardContent>
+        </Card>
+      </Grid>
+
+      {/* Alerts: only the ones that currently apply */}
+      <Grid size={12}>
+        <Typography variant="h6" gutterBottom>
+          Alerts
+        </Typography>
+        <Box sx={{ display: 'flex', flexDirection: 'column', gap: 2 }}>
+          {!hasAlerts && <Alert severity="success">No alerts right now.</Alert>}
+
+          {technician_mismatches.length > 0 && (
+            <Alert severity="error">
+              <AlertTitle>
+                {technician_mismatches.length} technician(s) assigned outside their branch
+              </AlertTitle>
+              <List dense disablePadding>
+                {technician_mismatches.map((item) => (
+                  <ListItem key={item.service_call_id} disableGutters>
+                    <ListItemText
+                      primary={`${item.technician_name} (${item.technician_branch_name}) is assigned to "${item.service_call_title}" at ATM ${item.atm_serial_number} (${item.atm_branch_name})`}
+                    />
+                  </ListItem>
+                ))}
+              </List>
+            </Alert>
+          )}
+
+          {low_cash.total > 0 && (
+            <Alert severity="warning">
+              <AlertTitle>
+                {low_cash.total} active ATM(s) below {formatCurrency(low_cash.threshold_amount)}
+              </AlertTitle>
+              <List dense disablePadding>
+                {low_cash.atms.map((atm) => (
+                  <ListItem key={atm.id} disableGutters>
+                    <ListItemText
+                      primary={`ATM ${atm.serial_number} at ${atm.branch_name}: ${formatCurrency(atm.cash_level)} (${atm.percent_full}% full)`}
+                    />
+                  </ListItem>
+                ))}
+              </List>
+            </Alert>
+          )}
+
+          {maintenance_alerts.length > 0 && (
+            <Alert severity="warning">
+              <AlertTitle>{maintenance_alerts.length} branch(es) with many ATMs in maintenance</AlertTitle>
+              <List dense disablePadding>
+                {maintenance_alerts.map((branch) => (
+                  <ListItem key={branch.branch_id} disableGutters>
+                    <ListItemText
+                      primary={`${branch.branch_name}: ${branch.maintenance_atms} of ${branch.total_atms} ATMs in maintenance (${branch.percent_in_maintenance}%)`}
+                    />
+                  </ListItem>
+                ))}
+              </List>
+            </Alert>
+          )}
+        </Box>
+      </Grid>
+
+      {/* Reports */}
+      <Grid size={{ xs: 12, md: 7 }}>
+        <Card>
+          <CardContent>
+            <Typography variant="h6" gutterBottom>
+              Completed vs failed service calls, by ATM model
+            </Typography>
+            <Table size="small">
+              <TableHead>
+                <TableRow>
+                  <TableCell>Model</TableCell>
+                  <TableCell align="right">Completed</TableCell>
+                  <TableCell align="right">Failed</TableCell>
+                  <TableCell align="right">Completed %</TableCell>
+                  <TableCell align="right">Failed %</TableCell>
+                </TableRow>
+              </TableHead>
+              <TableBody>
+                {completion_by_model.map((row) => (
+                  <TableRow key={row.model}>
+                    <TableCell>{row.model}</TableCell>
+                    <TableCell align="right">{row.completed}</TableCell>
+                    <TableCell align="right">{row.failed}</TableCell>
+                    <TableCell align="right">{formatPercent(row.completed_percent)}</TableCell>
+                    <TableCell align="right">{formatPercent(row.failed_percent)}</TableCell>
+                  </TableRow>
+                ))}
+              </TableBody>
+            </Table>
+          </CardContent>
+        </Card>
+      </Grid>
+      <Grid size={{ xs: 12, md: 5 }}>
+        <Card>
+          <CardContent>
+            <Typography variant="h6" gutterBottom>
+              Technicians on active calls, by supervisor
+            </Typography>
+            <Table size="small">
+              <TableHead>
+                <TableRow>
+                  <TableCell>Supervisor</TableCell>
+                  <TableCell align="right">Technicians</TableCell>
+                  <TableCell align="right">Active calls</TableCell>
+                </TableRow>
+              </TableHead>
+              <TableBody>
+                {technicians_by_supervisor.map((row) => (
+                  <TableRow key={row.supervisor_id}>
+                    <TableCell>Supervisor {row.supervisor_id}</TableCell>
+                    <TableCell align="right">{row.technicians}</TableCell>
+                    <TableCell align="right">{row.active_calls}</TableCell>
+                  </TableRow>
+                ))}
+              </TableBody>
+            </Table>
+          </CardContent>
+        </Card>
+      </Grid>
+    </Grid>
+  )
+}
+```
+
+**17e. Wire it into the router.** Replace `App.jsx`, and **delete `src/pages/HomePage.jsx`** (the dashboard replaces the old placeholder):
+
+**`frontend/src/App.jsx`**
+
+```jsx
+import { BrowserRouter, Navigate, Route, Routes } from 'react-router'
+
+import { AuthProvider } from './AuthContext.jsx'
+import ProtectedRoute from './ProtectedRoute.jsx'
+import Layout from './components/Layout.jsx'
+import DashboardPage from './pages/DashboardPage.jsx'
+import LoginPage from './pages/LoginPage.jsx'
+
+export default function App() {
+  return (
+    <BrowserRouter>
+      <AuthProvider>
+        <Routes>
+          <Route path="/login" element={<LoginPage />} />
+          <Route element={<ProtectedRoute />}>
+            <Route element={<Layout />}>
+              <Route path="/" element={<DashboardPage />} />
+            </Route>
+          </Route>
+          <Route path="*" element={<Navigate to="/" replace />} />
+        </Routes>
+      </AuthProvider>
+    </BrowserRouter>
+  )
+}
+```
+
+**17f. Try it.** With both servers running and the seed data loaded (Step 15), open `http://localhost:5173` and log in. You should see:
+
+- A green top bar with the app name, a Dashboard link, your name and a Log out button.
+- Four stat cards: **20** total ATMs, **6** open service calls, **3** critical open calls (red), **5** low-cash ATMs (orange).
+- Status badges: ATMs (Operational 13, In-Transport 1, Maintenance 5, Offline 1) and service calls (Pending 3, In-Progress 3, Completed 2, Failed 2).
+- Alerts: a red one listing the 3 technician mismatches, an orange one listing the 5 low-cash ATMs below $2,000.00, and an orange one for Downtown and Lakeside (2 of 4 ATMs, 50%). If no alert applies, a single green "No alerts right now." message appears instead.
+- Two tables: completed vs failed percentages by ATM model (Diebold 50/50, Hyosung 0/100, NCR 100/0) and technicians by supervisor (101 → 1, 102 → 2, 103 → 2).
+
+Then check that it is live data:
+
+1. Click **Refresh**: the button disables briefly and the page keeps its content.
+2. In `/docs`, `PATCH /atms/4` with `{"status": "Maintenance"}`, then **Refresh**. Downtown moves to 3 of 4 (75%) and ATM `10004` is no longer counted as an active ATM. Set it back to `Operational` afterwards (or re-run `python -m app.seed`).
+3. Narrow the browser window: the cards stack into a single column.
+
+---
+
+### Step 18 ✅ — Return readable names from the ATM and service call endpoints
+
+**Why:** The upcoming data grids should show names ("Riverside", "Alex Rivera"), but `GET /atms` and `GET /service-calls` return raw ids (`branch_id`, `atm_id`, `technician_id`). We could make the browser fetch several lists and look names up itself, but that means more requests and duplicated join logic on the client. Instead the backend adds the display fields, so each page needs a single request and the join logic lives in one place. This is the same approach the metrics endpoints already take.
+
+**What changes:** only the *responses*. Creating and updating work exactly as before, and **no migration is needed** because nothing changes in the database.
+
+| Endpoint | New fields |
+|---|---|
+| `GET/POST/PATCH /atms` | `branch_name` |
+| `GET/POST/PATCH /service-calls` | `atm_serial_number`, `atm_model`, `branch_name` (the ATM's branch), `technician_name` (`null` when unassigned) |
+
+**Concepts:**
+
+- **Python `@property`.** The models already link to each other (`atm.branch`, `service_call.atm`, `service_call.technician`). A `@property` is a read-only attribute computed on the fly, so `atm.branch_name` simply returns `self.branch.name`. Because Pydantic reads fields off the ORM object (`from_attributes=True`), adding a matching field to the response schema is all it takes to include it.
+- **Lazy loading.** By default SQLAlchemy fetches a related object the first time you touch it, with its own query.
+- **The N+1 query problem.** If a list of N rows each lazily loads its related rows, you run 1 query for the list plus N more for the relations. It is invisible with 10 rows and painful with 10,000. We measured it on the seed data:
+
+  | List | Without `joinedload` | With `joinedload` |
+  |---|---|---|
+  | 20 ATMs | 6 queries | 1 |
+  | 10 service calls | 23 queries | 1 |
+
+- **`joinedload`.** Tells SQLAlchemy to fetch the related rows in the same query using a SQL `JOIN`. We use it on the **list** endpoints. Single-record endpoints (get, create, patch) don't need it, since one extra lookup is fine.
+
+**18a. Add read-only properties to the models.**
+
+**`backend/app/models/atm.py`**: add `branch_name` at the end of the `ATM` class:
+
+```python
+    service_calls: Mapped[list["ServiceCall"]] = relationship(back_populates="atm")
+
+    @property
+    def branch_name(self) -> str:
+        return self.branch.name
+```
+
+**`backend/app/models/service_call.py`**: add the four properties at the end of the `ServiceCall` class:
+
+```python
+    reports: Mapped[list["Report"]] = relationship(back_populates="service_call")
+
+    @property
+    def atm_serial_number(self) -> str:
+        return self.atm.serial_number
+
+    @property
+    def atm_model(self) -> str:
+        return self.atm.model
+
+    @property
+    def branch_name(self) -> str:
+        return self.atm.branch.name
+
+    @property
+    def technician_name(self) -> str | None:
+        return self.technician.name if self.technician else None
+```
+
+A service call's `branch_name` is the branch of its ATM. `technician_name` is `None` when no technician is assigned.
+
+**18b. Add the fields to the response schemas.** Only the `Read` schemas change; the create and update schemas stay as they are.
+
+**`backend/app/schemas/atm.py`**
+
+```python
+class ATMRead(ATMCreate):
+    id: int
+    branch_name: str
+
+    model_config = ConfigDict(from_attributes=True)
+```
+
+**`backend/app/schemas/service_call.py`**
+
+```python
+class ServiceCallRead(ServiceCallCreate):
+    id: int
+    status: ServiceStatus
+    atm_serial_number: str
+    atm_model: str
+    branch_name: str  # the branch the ATM belongs to
+    technician_name: str | None
+
+    model_config = ConfigDict(from_attributes=True)
+```
+
+**18c. Load the related rows efficiently in the list endpoints.**
+
+**`backend/app/routers/atms.py`**: import `joinedload` and use it in `list_atms`:
+
+```python
+from sqlalchemy.orm import Session, joinedload
+
+@router.get("", response_model=list[ATMRead])
+def list_atms(db: Session = Depends(get_db)):
+    return db.scalars(select(ATM).options(joinedload(ATM.branch)).order_by(ATM.id)).all()
+```
+
+**`backend/app/routers/service_calls.py`**: import `joinedload` and use it in `list_service_calls`:
+
+```python
+from sqlalchemy.orm import Session, joinedload
+
+@router.get("", response_model=list[ServiceCallRead])
+def list_service_calls(db: Session = Depends(get_db)):
+    return db.scalars(
+        select(ServiceCall)
+        .options(
+            joinedload(ServiceCall.atm).joinedload(ATM.branch),
+            joinedload(ServiceCall.technician),
+        )
+        .order_by(ServiceCall.id)
+    ).all()
+```
+
+**18d. Verify.** The server reloads itself. In `/docs` (log in and Authorize first):
+
+| Request | Expected |
+|---|---|
+| `GET /atms` | Each ATM now has `"branch_name"`, for example serial `10001` → `Downtown` |
+| `GET /service-calls` | Each call has `atm_serial_number`, `atm_model`, `branch_name` and `technician_name`. Call 1: `10004`, `NCR SelfServ 84`, `Downtown`, `Marcus Lee`. Call 6: `technician_name` is `null` |
+| `PATCH /service-calls/6` with `{"technician_id": 2}` | `technician_name` becomes `Priya Nair` |
+| Same call with `{"technician_id": null}` | `technician_name` is `null` again |
+| `PATCH /atms/1` with `{"status": "Maintenance"}` | Still works, and the response includes `branch_name` |
+
+Set anything you changed back, or re-run `python -m app.seed`.
+
+---
+
 ---
 
 ## 6. Roadmap
@@ -2954,7 +3561,7 @@ Planned steps. Each becomes a numbered step above once built.
 - [x] Authentication (bcrypt password hashing + JWT login) — backend done; frontend login comes with the React app
 - [x] Seed script with sample data covering every metric
 - [x] Backend metrics endpoints (low cash, technician mismatches, completion ratio by model, maintenance alerts, technicians per supervisor)
-- [ ] Frontend: app layout (top bar, navigation) and dashboard with metric cards, alerts and status badges
+- [x] Frontend: app layout (top bar, navigation) and dashboard with metric cards, alerts and status badges
 - [ ] Frontend: DataGrid pages for ATMs and service calls (sorting, search, pagination)
 - [ ] Simulation logic (ATM cash levels, service dispatch)
 - [x] Frontend: React + Material UI project setup
@@ -2975,6 +3582,7 @@ Planned steps. Each becomes a numbered step above once built.
 - **Enum** – A type limited to a fixed list of named values.
 - **Salt** – Random data mixed into a password before hashing so identical passwords produce different hashes.
 - **localStorage** – A small key-value store in the browser that survives page reloads; we keep the login token there.
+- **N+1 query problem** – Running one query for a list plus one more per row to load related data; fixed by loading the related rows in the same query (`joinedload`).
 - **Hash** – A one-way scramble of data (used for passwords); you can check a match but can't reverse it.
 - **Hook** – A React function like `useState` or `useEffect` that gives a component memory or side effects.
 - **JWT** – A signed token proving who a user is, sent with each request.

@@ -20,5 +20,9 @@ class ServiceCallUpdate(BaseModel):
 class ServiceCallRead(ServiceCallCreate):
     id: int
     status: ServiceStatus
+    atm_serial_number: str
+    atm_model: str
+    branch_name: str  # the branch the ATM belongs to
+    technician_name: str | None
 
     model_config = ConfigDict(from_attributes=True)

@@ -25,3 +25,7 @@ class ATM(Base):
 
     branch: Mapped["Branch"] = relationship(back_populates="atms")
     service_calls: Mapped[list["ServiceCall"]] = relationship(back_populates="atm")
+
+    @property
+    def branch_name(self) -> str:
+        return self.branch.name

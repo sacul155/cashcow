@@ -1,6 +1,6 @@
 from fastapi import APIRouter, Depends, status
 from sqlalchemy import select
-from sqlalchemy.orm import Session
+from sqlalchemy.orm import Session, joinedload
 
 from app.database import get_db
 from app.models import ATM, ServiceCall, Technician
@@ -24,7 +24,14 @@ def create_service_call(data: ServiceCallCreate, db: Session = Depends(get_db)):
 
 @router.get("", response_model=list[ServiceCallRead])
 def list_service_calls(db: Session = Depends(get_db)):
-    return db.scalars(select(ServiceCall).order_by(ServiceCall.id)).all()
+    return db.scalars(
+        select(ServiceCall)
+        .options(
+            joinedload(ServiceCall.atm).joinedload(ATM.branch),
+            joinedload(ServiceCall.technician),
+        )
+        .order_by(ServiceCall.id)
+    ).all()
 
 
 @router.get("/{service_call_id}", response_model=ServiceCallRead)
