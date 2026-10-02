@@ -5,7 +5,7 @@ from sqlalchemy.orm import Session, aliased
 
 from app.config import settings
 from app.models import ATM, Branch, ServiceCall, Technician
-from app.models.enums import ATMStatus, ServicePriority, ServiceStatus
+from app.models.enums import ACTIVE_CALL_STATUSES, ATMStatus, ServicePriority, ServiceStatus
 from app.schemas.metrics import (
     BranchCount,
     Dashboard,
@@ -18,7 +18,6 @@ from app.schemas.metrics import (
     TechnicianMismatch,
 )
 
-ACTIVE_CALL_STATUSES = (ServiceStatus.PENDING, ServiceStatus.IN_PROGRESS)
 
 
 def percent(part: int, whole: int) -> float:

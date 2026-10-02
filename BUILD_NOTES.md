@@ -107,16 +107,31 @@ cashcow/
 │       ├── api.js         # apiFetch: attaches token, handles errors/401
 │       ├── AuthContext.jsx # Login state shared across the app (useAuth hook)
 │       ├── ProtectedRoute.jsx # Redirects logged-out users to /login
+│       ├── RequireRole.jsx    # Redirects users whose role may not see a page
+│       ├── roles.js       # Role names, each role's home page and navigation links
+│       ├── constants.js   # Allowed values for dropdowns (statuses, priorities)
 │       ├── format.js      # Currency and percent formatting
 │       ├── hooks/
-│       │   └── useApi.js  # Load data from the API (loading/error/reload)
+│       │   └── useApi.js  # Load data from the API (loading/error/reload/skip)
 │       ├── components/
-│       │   ├── Layout.jsx     # Top bar + navigation around every logged-in page
+│       │   ├── Layout.jsx     # Top bar + role badge + role-specific navigation
 │       │   ├── StatCard.jsx   # One headline number
-│       │   └── StatusChip.jsx # Colored status/priority badge
+│       │   ├── StatusChip.jsx # Colored status/priority badge
+│       │   ├── DataTable.jsx  # Searchable, sortable, paginated DataGrid
+│       │   ├── CrudPage.jsx   # Reusable list page: grid + Add/Edit/Delete
+│       │   ├── FormDialog.jsx # Pop-up form built from a list of field descriptions
+│       │   ├── ConfirmDialog.jsx # "Are you sure?" pop-up for deletes
+│       │   ├── ServiceCallActions.jsx # Technician's Start/Complete/Fail/Reports buttons
+│       │   └── ReportDialog.jsx # List and attach reports for a service call
 │       └── pages/
 │           ├── LoginPage.jsx
-│           └── DashboardPage.jsx
+│           ├── DashboardPage.jsx
+│           ├── AtmsPage.jsx
+│           ├── ServiceCallsPage.jsx            # Admin/Auditor view
+│           ├── TechnicianServiceCallsPage.jsx  # Field Technician view
+│           ├── BranchesPage.jsx
+│           ├── TechniciansPage.jsx
+│           └── UsersPage.jsx
 └── backend/
     ├── requirements.txt   # Exact list of Python packages + versions
     ├── .env               # Real settings (NOT committed to git)
@@ -130,7 +145,8 @@ cashcow/
         ├── main.py        # FastAPI app; run with uvicorn
         ├── security.py    # Password hashing + JWT creation/verification
         ├── metrics.py     # Metric calculations (SQL queries)
-        ├── dependencies.py # get_current_user (protects routes)
+        ├── dependencies.py # get_current_user + role checks (require_roles, admin_only, read_all)
+        ├── access.py      # Row-level rules: what a Field Technician may see
         ├── create_user.py # Command-line script to create a login
         ├── seed.py        # Loads sample data (python -m app.seed)
         ├── config.py      # Loads settings from .env
@@ -143,7 +159,8 @@ cashcow/
         │   ├── atms.py
         │   ├── service_calls.py
         │   ├── reports.py
-        │   └── metrics.py # /metrics/... endpoints
+        │   ├── metrics.py # /metrics/... endpoints
+        │   └── users.py   # User account management (Admin only)
         ├── schemas/       # Pydantic request/response shapes
         │   ├── auth.py
         │   ├── branch.py
@@ -151,6 +168,7 @@ cashcow/
         │   ├── atm.py
         │   ├── service_call.py
         │   ├── report.py
+        │   ├── user.py    # Create/update shapes for user accounts
         │   └── metrics.py # Shapes of the metric results
         └── models/
             ├── __init__.py      # Imports every model (Alembic needs this)
@@ -464,11 +482,16 @@ Read `A ──< B` as "one A has many B". For example, one branch has many ATMs,
 **Concepts used in the code:**
 
 - **PATCH** – An HTTP request that updates only the fields you send (unlike replacing the whole record).
+- **Authorization** – Deciding what a logged-in user may do (as opposed to authentication, which is proving who they are).
+- **Role** – A named set of permissions (Operations Admin, Field Technician, Auditor) assigned to each user.
+- **Row-level rule** – A rule that limits *which records* a user sees, not just which endpoints they may call (a technician sees only their own calls).
+- **403 vs 404** – `403 Forbidden`: you may not do this. `404 Not Found`: it doesn't exist *for you*; we use it for other people's records so their existence isn't revealed.
 - **Alias (SQL)** – A second name for the same table within one query, so it can be joined to itself or used twice.
 - **Check constraint** – A rule the database itself enforces on a column (for example, "exactly 5 digits"), even if the API is bypassed.
 - **Primary key** (`primary_key=True`) – the column that uniquely identifies each row. SQLAlchemy makes an integer `id` that counts up automatically.
 - **Props** – Inputs passed to a React component, like function arguments.
 - **Context** – A React feature that shares a value (like the logged-in user) with every component below a provider, without passing props through each layer.
+- **Props as configuration** – Passing settings (columns, form fields, callbacks) to a reusable component so one component serves many cases.
 - **Component** – In React, a function that returns JSX describing part of the page.
 - **Foreign key** (`ForeignKey("branches.id")`) – a column that stores the `id` of a row in another table. This is how tables are linked, and the database refuses a value that doesn't exist in the other table.
 - **`relationship()`** – a Python-side shortcut that lets you write `atm.branch` or `branch.atms` instead of running a lookup yourself. It creates no column. `back_populates` links the two sides so they stay in sync.
@@ -1620,6 +1643,8 @@ python -m app.create_user admin@cashcow.com "Admin User"
 | Refreshed the page | `/docs` forgets the token on reload; authorize again |
 | Token older than 60 minutes | Log in again |
 
+> **Updated in Step 20:** `create_user.py` now requires `--role` (and `--technician-id` for technicians), and `UserRead`/the `users` table gain a role. The version in Step 20 replaces the one above.
+
 ---
 
 ### Step 13 ✅ — Scaffold the frontend (Vite + React + Material UI)
@@ -2461,6 +2486,8 @@ Then in `/docs` (log in and Authorize first):
 | POST /atms with `"serial_number": "ATM-1"` | `422` (pattern mismatch) |
 | POST /atms with `"serial_number": "10001"` | `409` (already exists from the seed) |
 | PATCH /atms/1 with `"cash_level": "10000.01"` | `422` (over the ceiling) |
+
+> **Updated in Step 20:** the wipe at the top of `seed()` no longer uses `TRUNCATE ... CASCADE`, because the `users` table now references technicians and `CASCADE` would erase it. The seed now deletes in dependency order, keeps Admin and Auditor logins, and removes Field Technician logins. The version in Step 20 replaces the one above.
 
 ---
 
@@ -3545,6 +3572,2647 @@ Set anything you changed back, or re-run `python -m app.seed`.
 
 ---
 
+### Step 19 ✅ — Build the ATMs and Service Calls data grid pages
+
+**Why:** The dashboard summarizes; these pages let a user browse every record. Each page shows a table that can be **sorted** by any column, **searched** live, and **paginated**, using the Material UI DataGrid. Thanks to Step 18, the API already returns readable names, so each page needs a single request.
+
+**Concepts:**
+
+- **DataGrid** takes two things: `rows` (an array of objects, our API data) and `columns` (a list describing each column). Sorting and pagination are built in.
+- **Column options.**
+  - `field` names the property to show; `flex` and `width` size the column.
+  - `renderCell` draws custom content, such as our colored `StatusChip`.
+  - `valueGetter` changes the underlying value. Cash arrives as text (`"950.00"`), and sorting text puts `$10,000` before `$950`, so we convert to a number for correct sorting.
+  - `valueFormatter` changes only the display, turning the number back into `$950.00`.
+  - A missing technician (`null`) gets `valueGetter: value ?? 'Unassigned'`, so it shows readable text *and* is searchable.
+- **Search ("quick filter").** DataGrid can filter rows by a list of words, matching each against all columns; every word must match somewhere in the row (so `lakeside maintenance` narrows to Lakeside ATMs in maintenance). We supply `quickFilterValues` from our own text box rather than the grid's built-in toolbar, which keeps the search box in our page layout.
+- **`autoHeight`** makes the grid as tall as its rows, so the page scrolls instead of the grid.
+- **One shared `DataTable` component** holds the search box, error message and grid, so each page only describes its columns.
+- **MIT edition limits.** The free DataGrid supports the sorting, filtering and pagination used here, with at most 100 rows per page. Features such as row grouping or Excel export need the paid Pro tier.
+
+**Choices made:** there is no "percent full" column, because it would hardcode the $10,000 capacity in the frontend and duplicate a rule that lives in the backend settings. If we want it later, the API should return it (as the metrics do). Mismatched technicians are not highlighted on the service calls grid, since that would need the technician's branch in the response; the dashboard already covers that alert.
+
+**19a. The shared table component.** No new packages are needed: DataGrid, the search icon and React Router were installed earlier.
+
+**`frontend/src/components/DataTable.jsx`**
+
+```jsx
+import SearchIcon from '@mui/icons-material/Search'
+import { Alert, Box, Card, InputAdornment, TextField } from '@mui/material'
+import { DataGrid } from '@mui/x-data-grid'
+import { useState } from 'react'
+
+// A table with live search, column sorting and pagination.
+// Sorting and pagination are built into DataGrid; searching works by giving it "quick filter" words.
+export default function DataTable({ rows, columns, loading, error, searchLabel, pageSize = 10 }) {
+  const [search, setSearch] = useState('')
+
+  return (
+    <Box>
+      <TextField
+        label={searchLabel}
+        value={search}
+        onChange={(event) => setSearch(event.target.value)}
+        size="small"
+        sx={{ mb: 2, width: { xs: '100%', sm: 360 } }}
+        slotProps={{
+          input: {
+            startAdornment: (
+              <InputAdornment position="start">
+                <SearchIcon />
+              </InputAdornment>
+            ),
+          },
+        }}
+      />
+      {error && (
+        <Alert severity="error" sx={{ mb: 2 }}>
+          {error}
+        </Alert>
+      )}
+      <Card>
+        <DataGrid
+          rows={rows}
+          columns={columns}
+          loading={loading}
+          autoHeight
+          disableRowSelectionOnClick
+          pageSizeOptions={[5, 10, 25]}
+          initialState={{ pagination: { paginationModel: { pageSize } } }}
+          filterModel={{ items: [], quickFilterValues: search.split(' ').filter(Boolean) }}
+        />
+      </Card>
+    </Box>
+  )
+}
+```
+
+**19b. The ATMs page.** The `COLUMNS` list is defined *outside* the component so it isn't rebuilt on every render.
+
+**`frontend/src/pages/AtmsPage.jsx`**
+
+```jsx
+import RefreshIcon from '@mui/icons-material/Refresh'
+import { Box, Button, Typography } from '@mui/material'
+
+import DataTable from '../components/DataTable.jsx'
+import StatusChip from '../components/StatusChip.jsx'
+import { formatCurrency } from '../format.js'
+import { useApi } from '../hooks/useApi.js'
+
+const COLUMNS = [
+  { field: 'serial_number', headerName: 'Serial', width: 110 },
+  { field: 'model', headerName: 'Model', flex: 1, minWidth: 180 },
+  { field: 'branch_name', headerName: 'Branch', flex: 1, minWidth: 130 },
+  {
+    field: 'status',
+    headerName: 'Status',
+    width: 150,
+    renderCell: (params) => <StatusChip status={params.value} />,
+  },
+  {
+    field: 'cash_level',
+    headerName: 'Cash level',
+    type: 'number',
+    width: 130,
+    // The API sends money as text, so convert to a number to sort numerically
+    valueGetter: (value) => Number(value),
+    valueFormatter: (value) => formatCurrency(value),
+  },
+]
+
+export default function AtmsPage() {
+  const { data, loading, error, reload } = useApi('/atms')
+
+  return (
+    <Box>
+      <Box sx={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', mb: 3 }}>
+        <Typography variant="h4">ATMs</Typography>
+        <Button variant="outlined" startIcon={<RefreshIcon />} onClick={reload} disabled={loading}>
+          Refresh
+        </Button>
+      </Box>
+      <DataTable
+        rows={data ?? []}
+        columns={COLUMNS}
+        loading={loading}
+        error={error}
+        searchLabel="Search ATMs"
+      />
+    </Box>
+  )
+}
+```
+
+**19c. The Service Calls page.** It shows 5 rows per page (`pageSize={5}`) so pagination is visible with only 10 sample calls.
+
+**`frontend/src/pages/ServiceCallsPage.jsx`**
+
+```jsx
+import RefreshIcon from '@mui/icons-material/Refresh'
+import { Box, Button, Typography } from '@mui/material'
+
+import DataTable from '../components/DataTable.jsx'
+import StatusChip from '../components/StatusChip.jsx'
+import { useApi } from '../hooks/useApi.js'
+
+const COLUMNS = [
+  { field: 'title', headerName: 'Title', flex: 1.5, minWidth: 220 },
+  {
+    field: 'priority',
+    headerName: 'Priority',
+    width: 120,
+    renderCell: (params) => <StatusChip status={params.value} />,
+  },
+  {
+    field: 'status',
+    headerName: 'Status',
+    width: 140,
+    renderCell: (params) => <StatusChip status={params.value} />,
+  },
+  { field: 'atm_serial_number', headerName: 'ATM', width: 100 },
+  { field: 'atm_model', headerName: 'ATM model', flex: 1, minWidth: 170 },
+  { field: 'branch_name', headerName: 'Branch', flex: 1, minWidth: 120 },
+  {
+    field: 'technician_name',
+    headerName: 'Technician',
+    flex: 1,
+    minWidth: 140,
+    valueGetter: (value) => value ?? 'Unassigned',
+  },
+]
+
+export default function ServiceCallsPage() {
+  const { data, loading, error, reload } = useApi('/service-calls')
+
+  return (
+    <Box>
+      <Box sx={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', mb: 3 }}>
+        <Typography variant="h4">Service calls</Typography>
+        <Button variant="outlined" startIcon={<RefreshIcon />} onClick={reload} disabled={loading}>
+          Refresh
+        </Button>
+      </Box>
+      <DataTable
+        rows={data ?? []}
+        columns={COLUMNS}
+        loading={loading}
+        error={error}
+        searchLabel="Search service calls"
+        pageSize={5}
+      />
+    </Box>
+  )
+}
+```
+
+**19d. Add the navigation links and routes.** In `components/Layout.jsx` the `NAV_ITEMS` list grows:
+
+```jsx
+const NAV_ITEMS = [
+  { label: 'Dashboard', to: '/' },
+  { label: 'ATMs', to: '/atms' },
+  { label: 'Service Calls', to: '/service-calls' },
+]
+```
+
+In `App.jsx`, import the two pages and add their routes inside the `<Route element={<Layout />}>` block, so they get the login check and the top bar:
+
+**`frontend/src/App.jsx`**
+
+```jsx
+import { BrowserRouter, Navigate, Route, Routes } from 'react-router'
+
+import { AuthProvider } from './AuthContext.jsx'
+import AtmsPage from './pages/AtmsPage.jsx'
+import ServiceCallsPage from './pages/ServiceCallsPage.jsx'
+import ProtectedRoute from './ProtectedRoute.jsx'
+import Layout from './components/Layout.jsx'
+import DashboardPage from './pages/DashboardPage.jsx'
+import LoginPage from './pages/LoginPage.jsx'
+
+export default function App() {
+  return (
+    <BrowserRouter>
+      <AuthProvider>
+        <Routes>
+          <Route path="/login" element={<LoginPage />} />
+          <Route element={<ProtectedRoute />}>
+            <Route element={<Layout />}>
+              <Route path="/" element={<DashboardPage />} />
+              <Route path="/atms" element={<AtmsPage />} />
+              <Route path="/service-calls" element={<ServiceCallsPage />} />
+            </Route>
+          </Route>
+          <Route path="*" element={<Navigate to="/" replace />} />
+        </Routes>
+      </AuthProvider>
+    </BrowserRouter>
+  )
+}
+```
+
+**19e. Try it.** With both servers running and the seed data loaded:
+
+1. Click **ATMs**: 10 rows per page (1-10 of 20), colored status chips, dollar amounts. The current page is highlighted in the top bar.
+2. Type `maintenance` in the search box and the rows narrow immediately. Try `lakeside maintenance` too (2 rows).
+3. Click the **Cash level** header: lowest first ($800, $950, $1,200...), click again for highest first ($10,000 on top). It sorts by number, not text.
+4. Use the page arrows at the bottom, or change **Rows per page**.
+5. Click **Service Calls**: 5 per page (1-5 of 10), with priority and status chips. Search `unassigned` to find the call with no technician.
+6. Change data in `/docs` (for example `PATCH /atms/4` to `Maintenance`), then click **Refresh** to see it update.
+
+---
+
+### Step 20 ✅ — Role-based access control: the backend
+
+**Why:** Until now every logged-in user could do everything. Real systems give different people different powers. We add three **roles** and make the API enforce them:
+
+| Role | Can do |
+|---|---|
+| **Operations Admin** | Everything: create, read, update and delete branches, technicians, ATMs, service calls and user accounts |
+| **Field Technician** | See only their own ATMs and service calls; move their calls forward (`Pending → In-Progress → Completed/Failed`); attach diagnostic reports to their own calls |
+| **Auditor** | View the dashboard and every list (read-only). Cannot change anything |
+
+**The permission matrix** (what the API enforces on every endpoint):
+
+| | Operations Admin | Field Technician | Auditor |
+|---|---|---|---|
+| Dashboard and `/metrics/*` | yes | no | yes |
+| Branches and technicians: view | yes | no | yes |
+| Branches and technicians: create, edit, delete | yes | no | no |
+| ATMs: view | all | only ATMs with an *active* call assigned to them | all |
+| ATMs: create, edit, delete | yes | no | no |
+| Service calls: view | all | only their own | all |
+| Service calls: create, edit, delete | yes | no | no |
+| Service calls: change status | any status | own calls, forward steps only | no |
+| Reports: view | all | reports on their own calls | all |
+| Reports: create | yes | on their own calls | no |
+| User accounts: view, create, edit, delete | yes | no | no |
+
+**Concepts:**
+
+- **Authentication vs authorization.** Authentication (Step 12) answers "who are you?". **Authorization** answers "what may you do?". Roles are authorization.
+- **Role stored on the user, read from the database on every request.** We do *not* put the role in the JWT. If we did, demoting or deleting someone would not take effect until their token expired. Our `get_current_user` already looks the user up on every request, so changes apply immediately.
+- **Two layers of rules.**
+  1. **Role rules:** `require_roles(...)` on a route. The wrong role gets `403 Forbidden`.
+  2. **Row rules (technicians):** a technician's queries are *filtered* to their own data (`access.py`). Anything outside it is reported as `404 Not Found`, so its existence isn't even revealed.
+- **Hiding is not security.** The API is the authority. The frontend (Steps 21-22) only decides what to *show*.
+- **A dependency factory.** `require_roles(UserRole.ADMIN, ...)` is a function that *builds* a FastAPI dependency. `admin_only` and `read_all` are ready-made ones.
+- **Database check constraint.** A Field Technician login must be linked to a technician, and other roles must not be. We enforce that in the database itself, not only in the API.
+- **Why not `TRUNCATE ... CASCADE` any more.** Users now reference technicians. `TRUNCATE ... CASCADE` would wipe the `users` table, so the seed script deletes in dependency order instead.
+
+**Rules around deleting** (agreed up front, enforced with `409 Conflict`):
+
+- A branch with ATMs or technicians, an ATM with service calls, and a technician with service calls or a login can't be deleted.
+- Deleting a **service call** also deletes its reports.
+- An Admin can't delete their own account or change their own role. Only Admins can manage users, so this also means the last Admin can never be removed.
+
+**20a. The role enum and a shared constant.** Append to `backend/app/models/enums.py`, and change `metrics.py` to import `ACTIVE_CALL_STATUSES` from there instead of defining it locally:
+
+```python
+class UserRole(str, Enum):
+    ADMIN = "Operations Admin"
+    TECHNICIAN = "Field Technician"
+    AUDITOR = "Auditor"
+
+# A service call that is still open
+ACTIVE_CALL_STATUSES = (ServiceStatus.PENDING, ServiceStatus.IN_PROGRESS)
+```
+
+
+**20b. The `User` model gets a role and a technician link.**
+
+**`backend/app/models/user.py`**
+
+```python
+from sqlalchemy import CheckConstraint, Enum, ForeignKey, String, UniqueConstraint
+from sqlalchemy.orm import Mapped, mapped_column, relationship
+
+from app.models.base import Base
+from app.models.enums import UserRole
+
+
+class User(Base):
+    __tablename__ = "users"
+    __table_args__ = (
+        # One login per technician
+        UniqueConstraint("technician_id", name="uq_users_technician_id"),
+        # Field Technician accounts must be linked to a technician; other roles must not be
+        CheckConstraint(
+            "(role = 'Field Technician') = (technician_id IS NOT NULL)",
+            name="ck_users_technician_role",
+        ),
+    )
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    email: Mapped[str] = mapped_column(String(255), unique=True, index=True)
+    full_name: Mapped[str] = mapped_column(String(100))
+    hashed_password: Mapped[str] = mapped_column(String(255))
+    role: Mapped[UserRole] = mapped_column(
+        Enum(UserRole, name="user_role", values_callable=lambda e: [m.value for m in e])
+    )
+    technician_id: Mapped[int | None] = mapped_column(
+        ForeignKey("technicians.id", name="fk_users_technician_id")
+    )
+
+    technician: Mapped["Technician | None"] = relationship()
+```
+
+In `backend/app/models/service_call.py`, the `reports` relationship gets a cascade so deleting a call deletes its reports:
+
+```python
+    reports: Mapped[list["Report"]] = relationship(
+        back_populates="service_call", cascade="all, delete-orphan"
+    )
+```
+
+**20c. The migration (written by hand).**
+
+```bash
+cd backend
+source .venv/bin/activate
+alembic revision -m "add user roles"
+```
+
+We write this one by hand (no `--autogenerate`) for two reasons: autogenerate would add a `NOT NULL` column to a table that already has rows, which fails, and it can't see check constraints. The temporary `server_default` below gives existing users a role; **every existing account becomes an Operations Admin**. Replace the two functions in the new file with:
+
+```python
+def upgrade() -> None:
+    """Upgrade schema."""
+    user_role = sa.Enum("Operations Admin", "Field Technician", "Auditor", name="user_role")
+    user_role.create(op.get_bind())
+
+    # Existing accounts were all created as full users, so they become Operations Admins.
+    # The temporary server_default fills in existing rows; we remove it right after.
+    op.add_column(
+        "users",
+        sa.Column("role", user_role, nullable=False, server_default="Operations Admin"),
+    )
+    op.alter_column("users", "role", server_default=None)
+
+    op.add_column("users", sa.Column("technician_id", sa.Integer(), nullable=True))
+    op.create_foreign_key("fk_users_technician_id", "users", "technicians", ["technician_id"], ["id"])
+    op.create_unique_constraint("uq_users_technician_id", "users", ["technician_id"])
+    op.create_check_constraint(
+        "ck_users_technician_role",
+        "users",
+        "(role = 'Field Technician') = (technician_id IS NOT NULL)",
+    )
+
+
+def downgrade() -> None:
+    """Downgrade schema."""
+    op.drop_constraint("ck_users_technician_role", "users", type_="check")
+    op.drop_constraint("uq_users_technician_id", "users", type_="unique")
+    op.drop_constraint("fk_users_technician_id", "users", type_="foreignkey")
+    op.drop_column("users", "technician_id")
+    op.drop_column("users", "role")
+    sa.Enum(name="user_role").drop(op.get_bind())
+```
+
+```bash
+alembic upgrade head
+alembic check
+```
+
+Expected: `No new upgrade operations detected.`
+
+**20d. Permission helpers.** Add `from app.models.enums import UserRole` to `dependencies.py`'s imports and append the role helpers:
+
+```python
+def require_roles(*roles: UserRole):
+    """Build a dependency that only lets users with one of the given roles through."""
+
+    def check_role(user: User = Depends(get_current_user)) -> User:
+        if user.role not in roles:
+            raise HTTPException(status_code=403, detail="You do not have permission to do this")
+        return user
+
+    return check_role
+
+
+admin_only = require_roles(UserRole.ADMIN)
+# Roles that may see everything (but only the Admin may change anything)
+read_all = require_roles(UserRole.ADMIN, UserRole.AUDITOR)
+```
+
+Create `backend/app/access.py` for the technician row rules:
+
+**`backend/app/access.py`**
+
+```python
+from fastapi import HTTPException
+from sqlalchemy import select
+from sqlalchemy.orm import Session
+
+from app.models import ATM, Report, ServiceCall, User
+from app.models.enums import ACTIVE_CALL_STATUSES, UserRole
+
+# Row-level rules. Admins and Auditors see every row. A Field Technician sees only:
+#   - service calls assigned to them,
+#   - reports on those calls,
+#   - ATMs that have an active (Pending / In-Progress) call assigned to them.
+# Anything outside that is reported as "not found", so its existence isn't revealed.
+
+
+def visible_atms(statement, user: User):
+    if user.role == UserRole.TECHNICIAN:
+        assigned = select(ServiceCall.atm_id).where(
+            ServiceCall.technician_id == user.technician_id,
+            ServiceCall.status.in_(ACTIVE_CALL_STATUSES),
+        )
+        return statement.where(ATM.id.in_(assigned))
+    return statement
+
+
+def visible_service_calls(statement, user: User):
+    if user.role == UserRole.TECHNICIAN:
+        return statement.where(ServiceCall.technician_id == user.technician_id)
+    return statement
+
+
+def visible_reports(statement, user: User):
+    if user.role == UserRole.TECHNICIAN:
+        own_calls = select(ServiceCall.id).where(ServiceCall.technician_id == user.technician_id)
+        return statement.where(Report.service_call_id.in_(own_calls))
+    return statement
+
+
+def get_visible_atm(db: Session, user: User, atm_id: int) -> ATM:
+    atm = db.scalar(visible_atms(select(ATM).where(ATM.id == atm_id), user))
+    if atm is None:
+        raise HTTPException(status_code=404, detail="ATM not found")
+    return atm
+
+
+def get_visible_service_call(db: Session, user: User, service_call_id: int) -> ServiceCall:
+    service_call = db.scalar(
+        visible_service_calls(select(ServiceCall).where(ServiceCall.id == service_call_id), user)
+    )
+    if service_call is None:
+        raise HTTPException(status_code=404, detail="Service call not found")
+    return service_call
+
+
+def get_visible_report(db: Session, user: User, report_id: int) -> Report:
+    report = db.scalar(visible_reports(select(Report).where(Report.id == report_id), user))
+    if report is None:
+        raise HTTPException(status_code=404, detail="Report not found")
+    return report
+```
+
+**20e. Schemas.** `UserRead` now includes the role and technician link (never the password hash). New `schemas/user.py`, plus small additions to the other schema files:
+
+```python
+class UserRead(BaseModel):
+    id: int
+    email: EmailStr
+    full_name: str
+    role: UserRole
+    technician_id: int | None
+
+    model_config = ConfigDict(from_attributes=True)
+```
+
+**`backend/app/schemas/user.py`**
+
+```python
+from pydantic import BaseModel, EmailStr, Field
+
+from app.models.enums import UserRole
+
+
+class UserCreate(BaseModel):
+    email: EmailStr
+    full_name: str = Field(min_length=1, max_length=100)
+    password: str = Field(min_length=8, max_length=72)
+    role: UserRole
+    technician_id: int | None = None  # required for Field Technicians, not allowed otherwise
+
+
+class UserUpdate(BaseModel):
+    full_name: str | None = Field(default=None, min_length=1, max_length=100)
+    password: str | None = Field(default=None, min_length=8, max_length=72)
+    role: UserRole | None = None
+    technician_id: int | None = None
+```
+
+Append `BranchUpdate` to `schemas/branch.py`, `TechnicianUpdate` to `schemas/technician.py`, `ServiceCallStatusUpdate` to `schemas/service_call.py`, and add `branch_id: int | None = None` to the end of `ATMUpdate` in `schemas/atm.py` so an ATM can be relocated:
+
+```python
+class BranchUpdate(BaseModel):
+    name: str | None = Field(default=None, min_length=1, max_length=100)
+    region: str | None = Field(default=None, min_length=1, max_length=100)
+    capacity: int | None = Field(default=None, gt=0)
+    supervisor_id: int | None = None
+```
+
+```python
+class TechnicianUpdate(BaseModel):
+    name: str | None = Field(default=None, min_length=1, max_length=100)
+    branch_id: int | None = None
+```
+
+```python
+class ServiceCallStatusUpdate(BaseModel):
+    status: ServiceStatus
+```
+
+```python
+class ATMUpdate(BaseModel):
+    model: str | None = Field(default=None, min_length=1, max_length=100)
+    status: ATMStatus | None = None
+    cash_level: Decimal | None = Field(default=None, ge=0, le=10000, max_digits=12, decimal_places=2)
+    branch_id: int | None = None
+```
+
+**20f. The routers.** Each route now declares who may use it. Replace these files:
+
+**`backend/app/routers/branches.py`**
+
+```python
+from fastapi import APIRouter, Depends, HTTPException, status
+from sqlalchemy import exists, select
+from sqlalchemy.orm import Session
+
+from app.database import get_db
+from app.dependencies import admin_only, read_all
+from app.models import ATM, Branch, Technician
+from app.routers.utils import get_or_404
+from app.schemas.branch import BranchCreate, BranchRead, BranchUpdate
+
+router = APIRouter(prefix="/branches", tags=["branches"])
+
+
+@router.post(
+    "",
+    response_model=BranchRead,
+    status_code=status.HTTP_201_CREATED,
+    dependencies=[Depends(admin_only)],
+)
+def create_branch(data: BranchCreate, db: Session = Depends(get_db)):
+    branch = Branch(**data.model_dump())
+    db.add(branch)
+    db.commit()
+    db.refresh(branch)
+    return branch
+
+
+@router.get("", response_model=list[BranchRead], dependencies=[Depends(read_all)])
+def list_branches(db: Session = Depends(get_db)):
+    return db.scalars(select(Branch).order_by(Branch.id)).all()
+
+
+@router.get("/{branch_id}", response_model=BranchRead, dependencies=[Depends(read_all)])
+def get_branch(branch_id: int, db: Session = Depends(get_db)):
+    return get_or_404(db, Branch, branch_id, "Branch")
+
+
+@router.patch("/{branch_id}", response_model=BranchRead, dependencies=[Depends(admin_only)])
+def update_branch(branch_id: int, data: BranchUpdate, db: Session = Depends(get_db)):
+    branch = get_or_404(db, Branch, branch_id, "Branch")
+    # Only fields the client sent; explicit nulls are ignored (no branch column is optional)
+    for field, value in data.model_dump(exclude_unset=True, exclude_none=True).items():
+        setattr(branch, field, value)
+    db.commit()
+    db.refresh(branch)
+    return branch
+
+
+@router.delete(
+    "/{branch_id}", status_code=status.HTTP_204_NO_CONTENT, dependencies=[Depends(admin_only)]
+)
+def delete_branch(branch_id: int, db: Session = Depends(get_db)):
+    branch = get_or_404(db, Branch, branch_id, "Branch")
+    has_atms = db.scalar(select(exists().where(ATM.branch_id == branch_id)))
+    has_technicians = db.scalar(select(exists().where(Technician.branch_id == branch_id)))
+    if has_atms or has_technicians:
+        raise HTTPException(
+            status_code=409,
+            detail="Branch still has ATMs or technicians; move or delete them first",
+        )
+    db.delete(branch)
+    db.commit()
+```
+
+**`backend/app/routers/technicians.py`**
+
+```python
+from fastapi import APIRouter, Depends, HTTPException, status
+from sqlalchemy import exists, select
+from sqlalchemy.orm import Session
+
+from app.database import get_db
+from app.dependencies import admin_only, read_all
+from app.models import Branch, ServiceCall, Technician, User
+from app.routers.utils import get_or_404
+from app.schemas.technician import TechnicianCreate, TechnicianRead, TechnicianUpdate
+
+router = APIRouter(prefix="/technicians", tags=["technicians"])
+
+
+@router.post(
+    "",
+    response_model=TechnicianRead,
+    status_code=status.HTTP_201_CREATED,
+    dependencies=[Depends(admin_only)],
+)
+def create_technician(data: TechnicianCreate, db: Session = Depends(get_db)):
+    get_or_404(db, Branch, data.branch_id, "Branch")
+    technician = Technician(**data.model_dump())
+    db.add(technician)
+    db.commit()
+    db.refresh(technician)
+    return technician
+
+
+@router.get("", response_model=list[TechnicianRead], dependencies=[Depends(read_all)])
+def list_technicians(db: Session = Depends(get_db)):
+    return db.scalars(select(Technician).order_by(Technician.id)).all()
+
+
+@router.get("/{technician_id}", response_model=TechnicianRead, dependencies=[Depends(read_all)])
+def get_technician(technician_id: int, db: Session = Depends(get_db)):
+    return get_or_404(db, Technician, technician_id, "Technician")
+
+
+@router.patch(
+    "/{technician_id}", response_model=TechnicianRead, dependencies=[Depends(admin_only)]
+)
+def update_technician(technician_id: int, data: TechnicianUpdate, db: Session = Depends(get_db)):
+    technician = get_or_404(db, Technician, technician_id, "Technician")
+    changes = data.model_dump(exclude_unset=True, exclude_none=True)
+    if "branch_id" in changes:
+        get_or_404(db, Branch, changes["branch_id"], "Branch")
+    for field, value in changes.items():
+        setattr(technician, field, value)
+    db.commit()
+    db.refresh(technician)
+    return technician
+
+
+@router.delete(
+    "/{technician_id}", status_code=status.HTTP_204_NO_CONTENT, dependencies=[Depends(admin_only)]
+)
+def delete_technician(technician_id: int, db: Session = Depends(get_db)):
+    technician = get_or_404(db, Technician, technician_id, "Technician")
+    has_calls = db.scalar(select(exists().where(ServiceCall.technician_id == technician_id)))
+    has_login = db.scalar(select(exists().where(User.technician_id == technician_id)))
+    if has_calls or has_login:
+        raise HTTPException(
+            status_code=409,
+            detail="Technician still has service calls or a login account; remove those first",
+        )
+    db.delete(technician)
+    db.commit()
+```
+
+**`backend/app/routers/atms.py`**
+
+```python
+from fastapi import APIRouter, Depends, HTTPException, status
+from sqlalchemy import exists, select
+from sqlalchemy.exc import IntegrityError
+from sqlalchemy.orm import Session, joinedload
+
+from app.access import get_visible_atm, visible_atms
+from app.database import get_db
+from app.dependencies import admin_only, get_current_user
+from app.models import ATM, Branch, ServiceCall, User
+from app.routers.utils import get_or_404
+from app.schemas.atm import ATMCreate, ATMRead, ATMUpdate
+
+router = APIRouter(prefix="/atms", tags=["atms"])
+
+
+@router.post(
+    "", response_model=ATMRead, status_code=status.HTTP_201_CREATED, dependencies=[Depends(admin_only)]
+)
+def create_atm(data: ATMCreate, db: Session = Depends(get_db)):
+    get_or_404(db, Branch, data.branch_id, "Branch")
+    atm = ATM(**data.model_dump())
+    db.add(atm)
+    try:
+        db.commit()
+    except IntegrityError:
+        db.rollback()
+        raise HTTPException(
+            status_code=409, detail="An ATM with that serial number already exists"
+        )
+    db.refresh(atm)
+    return atm
+
+
+@router.get("", response_model=list[ATMRead])
+def list_atms(user: User = Depends(get_current_user), db: Session = Depends(get_db)):
+    statement = select(ATM).options(joinedload(ATM.branch)).order_by(ATM.id)
+    return db.scalars(visible_atms(statement, user)).all()
+
+
+@router.get("/{atm_id}", response_model=ATMRead)
+def get_atm(atm_id: int, user: User = Depends(get_current_user), db: Session = Depends(get_db)):
+    return get_visible_atm(db, user, atm_id)
+
+
+@router.patch("/{atm_id}", response_model=ATMRead, dependencies=[Depends(admin_only)])
+def update_atm(atm_id: int, data: ATMUpdate, db: Session = Depends(get_db)):
+    atm = get_or_404(db, ATM, atm_id, "ATM")
+    # Only fields the client sent; explicit nulls are ignored (no ATM column is optional)
+    changes = data.model_dump(exclude_unset=True, exclude_none=True)
+    if "branch_id" in changes:
+        get_or_404(db, Branch, changes["branch_id"], "Branch")
+    for field, value in changes.items():
+        setattr(atm, field, value)
+    db.commit()
+    db.refresh(atm)
+    return atm
+
+
+@router.delete("/{atm_id}", status_code=status.HTTP_204_NO_CONTENT, dependencies=[Depends(admin_only)])
+def delete_atm(atm_id: int, db: Session = Depends(get_db)):
+    atm = get_or_404(db, ATM, atm_id, "ATM")
+    if db.scalar(select(exists().where(ServiceCall.atm_id == atm_id))):
+        raise HTTPException(
+            status_code=409, detail="ATM still has service calls; delete those first"
+        )
+    db.delete(atm)
+    db.commit()
+```
+
+**`backend/app/routers/service_calls.py`**
+
+```python
+from fastapi import APIRouter, Depends, HTTPException, status
+from sqlalchemy import select
+from sqlalchemy.orm import Session, joinedload
+
+from app.access import get_visible_service_call, visible_service_calls
+from app.database import get_db
+from app.dependencies import admin_only, get_current_user, require_roles
+from app.models import ATM, ServiceCall, Technician, User
+from app.models.enums import ServiceStatus, UserRole
+from app.routers.utils import get_or_404
+from app.schemas.service_call import (
+    ServiceCallCreate,
+    ServiceCallRead,
+    ServiceCallStatusUpdate,
+    ServiceCallUpdate,
+)
+
+router = APIRouter(prefix="/service-calls", tags=["service calls"])
+
+# The only status changes a Field Technician may make (Admins may set any status)
+TECHNICIAN_TRANSITIONS = {
+    ServiceStatus.PENDING: {ServiceStatus.IN_PROGRESS},
+    ServiceStatus.IN_PROGRESS: {ServiceStatus.COMPLETED, ServiceStatus.FAILED},
+}
+
+
+@router.post(
+    "",
+    response_model=ServiceCallRead,
+    status_code=status.HTTP_201_CREATED,
+    dependencies=[Depends(admin_only)],
+)
+def create_service_call(data: ServiceCallCreate, db: Session = Depends(get_db)):
+    get_or_404(db, ATM, data.atm_id, "ATM")
+    if data.technician_id is not None:
+        get_or_404(db, Technician, data.technician_id, "Technician")
+    service_call = ServiceCall(**data.model_dump())
+    db.add(service_call)
+    db.commit()
+    db.refresh(service_call)
+    return service_call
+
+
+@router.get("", response_model=list[ServiceCallRead])
+def list_service_calls(user: User = Depends(get_current_user), db: Session = Depends(get_db)):
+    statement = (
+        select(ServiceCall)
+        .options(
+            joinedload(ServiceCall.atm).joinedload(ATM.branch),
+            joinedload(ServiceCall.technician),
+        )
+        .order_by(ServiceCall.id)
+    )
+    return db.scalars(visible_service_calls(statement, user)).all()
+
+
+@router.get("/{service_call_id}", response_model=ServiceCallRead)
+def get_service_call(
+    service_call_id: int, user: User = Depends(get_current_user), db: Session = Depends(get_db)
+):
+    return get_visible_service_call(db, user, service_call_id)
+
+
+@router.patch(
+    "/{service_call_id}", response_model=ServiceCallRead, dependencies=[Depends(admin_only)]
+)
+def update_service_call(
+    service_call_id: int, data: ServiceCallUpdate, db: Session = Depends(get_db)
+):
+    service_call = get_or_404(db, ServiceCall, service_call_id, "Service call")
+    # Only fields the client sent. technician_id may be null (unassign); the rest may not.
+    changes = {
+        field: value
+        for field, value in data.model_dump(exclude_unset=True).items()
+        if value is not None or field == "technician_id"
+    }
+    if changes.get("technician_id") is not None:
+        get_or_404(db, Technician, changes["technician_id"], "Technician")
+    for field, value in changes.items():
+        setattr(service_call, field, value)
+    db.commit()
+    db.refresh(service_call)
+    return service_call
+
+
+@router.patch("/{service_call_id}/status", response_model=ServiceCallRead)
+def change_service_call_status(
+    service_call_id: int,
+    data: ServiceCallStatusUpdate,
+    user: User = Depends(require_roles(UserRole.ADMIN, UserRole.TECHNICIAN)),
+    db: Session = Depends(get_db),
+):
+    # For a technician this only finds calls assigned to them (anything else is a 404)
+    service_call = get_visible_service_call(db, user, service_call_id)
+    if user.role == UserRole.TECHNICIAN:
+        allowed = TECHNICIAN_TRANSITIONS.get(service_call.status, set())
+        if data.status not in allowed:
+            raise HTTPException(
+                status_code=409,
+                detail=f"A technician cannot change a call from "
+                f"{service_call.status.value} to {data.status.value}",
+            )
+    service_call.status = data.status
+    db.commit()
+    db.refresh(service_call)
+    return service_call
+
+
+@router.delete(
+    "/{service_call_id}",
+    status_code=status.HTTP_204_NO_CONTENT,
+    dependencies=[Depends(admin_only)],
+)
+def delete_service_call(service_call_id: int, db: Session = Depends(get_db)):
+    service_call = get_or_404(db, ServiceCall, service_call_id, "Service call")
+    db.delete(service_call)  # its reports are deleted with it (see the model's cascade)
+    db.commit()
+```
+
+**`backend/app/routers/reports.py`**
+
+```python
+from fastapi import APIRouter, Depends, status
+from sqlalchemy import select
+from sqlalchemy.orm import Session
+
+from app.access import get_visible_report, get_visible_service_call, visible_reports
+from app.database import get_db
+from app.dependencies import get_current_user, require_roles
+from app.models import Report, User
+from app.models.enums import UserRole
+from app.schemas.report import ReportCreate, ReportRead
+
+router = APIRouter(prefix="/reports", tags=["reports"])
+
+
+@router.post("", response_model=ReportRead, status_code=status.HTTP_201_CREATED)
+def create_report(
+    data: ReportCreate,
+    user: User = Depends(require_roles(UserRole.ADMIN, UserRole.TECHNICIAN)),
+    db: Session = Depends(get_db),
+):
+    # A technician can only attach reports to their own service calls (else 404)
+    get_visible_service_call(db, user, data.service_call_id)
+    report = Report(**data.model_dump())
+    db.add(report)
+    db.commit()
+    db.refresh(report)
+    return report
+
+
+@router.get("", response_model=list[ReportRead])
+def list_reports(user: User = Depends(get_current_user), db: Session = Depends(get_db)):
+    return db.scalars(visible_reports(select(Report).order_by(Report.id), user)).all()
+
+
+@router.get("/{report_id}", response_model=ReportRead)
+def get_report(report_id: int, user: User = Depends(get_current_user), db: Session = Depends(get_db)):
+    return get_visible_report(db, user, report_id)
+```
+
+The new routes for managing user accounts (Admin only):
+
+**`backend/app/routers/users.py`**
+
+```python
+from fastapi import APIRouter, Depends, HTTPException, status
+from sqlalchemy import select
+from sqlalchemy.orm import Session
+
+from app.database import get_db
+from app.dependencies import admin_only
+from app.models import Technician, User
+from app.models.enums import UserRole
+from app.routers.utils import get_or_404
+from app.schemas.auth import UserRead
+from app.schemas.user import UserCreate, UserUpdate
+from app.security import hash_password
+
+# Every route here is for Operations Admins only
+router = APIRouter(prefix="/users", tags=["users"])
+
+
+def check_role_link(db: Session, role: UserRole, technician_id: int | None, user_id: int | None = None):
+    """A Field Technician login must be linked to exactly one technician; other roles must not."""
+    if role == UserRole.TECHNICIAN:
+        if technician_id is None:
+            raise HTTPException(
+                status_code=422, detail="A Field Technician account must be linked to a technician"
+            )
+        get_or_404(db, Technician, technician_id, "Technician")
+        already_linked = db.scalar(
+            select(User).where(User.technician_id == technician_id, User.id != user_id)
+        )
+        if already_linked:
+            raise HTTPException(status_code=409, detail="That technician already has a login")
+    elif technician_id is not None:
+        raise HTTPException(
+            status_code=422, detail="Only Field Technician accounts can be linked to a technician"
+        )
+
+
+def hash_or_422(password: str) -> str:
+    try:
+        return hash_password(password)
+    except ValueError as error:
+        raise HTTPException(status_code=422, detail=str(error))
+
+
+@router.post("", response_model=UserRead, status_code=status.HTTP_201_CREATED)
+def create_user(data: UserCreate, db: Session = Depends(get_db), _: User = Depends(admin_only)):
+    email = data.email.lower()
+    if db.scalar(select(User).where(User.email == email)):
+        raise HTTPException(status_code=409, detail="A user with that email already exists")
+    check_role_link(db, data.role, data.technician_id)
+    user = User(
+        email=email,
+        full_name=data.full_name,
+        hashed_password=hash_or_422(data.password),
+        role=data.role,
+        technician_id=data.technician_id,
+    )
+    db.add(user)
+    db.commit()
+    db.refresh(user)
+    return user
+
+
+@router.get("", response_model=list[UserRead], dependencies=[Depends(admin_only)])
+def list_users(db: Session = Depends(get_db)):
+    return db.scalars(select(User).order_by(User.id)).all()
+
+
+@router.get("/{user_id}", response_model=UserRead, dependencies=[Depends(admin_only)])
+def get_user(user_id: int, db: Session = Depends(get_db)):
+    return get_or_404(db, User, user_id, "User")
+
+
+@router.patch("/{user_id}", response_model=UserRead)
+def update_user(
+    user_id: int,
+    data: UserUpdate,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(admin_only),
+):
+    user = get_or_404(db, User, user_id, "User")
+    # Only fields the client sent. technician_id may be null (unlink); the rest may not.
+    changes = {
+        field: value
+        for field, value in data.model_dump(exclude_unset=True).items()
+        if value is not None or field == "technician_id"
+    }
+
+    new_role = changes.get("role", user.role)
+    if "technician_id" in changes:
+        new_technician_id = changes["technician_id"]
+    elif new_role == UserRole.TECHNICIAN:
+        new_technician_id = user.technician_id
+    else:
+        new_technician_id = None  # moving away from Field Technician unlinks the technician
+
+    if new_role != user.role and user.id == current_user.id:
+        raise HTTPException(status_code=409, detail="You cannot change your own role")
+    check_role_link(db, new_role, new_technician_id, user_id=user.id)
+
+    user.role = new_role
+    user.technician_id = new_technician_id
+    if "full_name" in changes:
+        user.full_name = changes["full_name"]
+    if "password" in changes:
+        user.hashed_password = hash_or_422(changes["password"])
+    db.commit()
+    db.refresh(user)
+    return user
+
+
+@router.delete("/{user_id}", status_code=status.HTTP_204_NO_CONTENT)
+def delete_user(
+    user_id: int, db: Session = Depends(get_db), current_user: User = Depends(admin_only)
+):
+    user = get_or_404(db, User, user_id, "User")
+    if user.id == current_user.id:
+        raise HTTPException(status_code=409, detail="You cannot delete your own account")
+    db.delete(user)
+    db.commit()
+```
+
+The metrics router becomes Admin/Auditor only: add `from app.dependencies import read_all` to its imports and change its first lines to:
+
+```python
+router = APIRouter(prefix="/metrics", tags=["metrics"], dependencies=[Depends(read_all)])
+```
+
+**20g. Wire it together.**
+
+**`backend/app/main.py`**
+
+```python
+from fastapi import Depends, FastAPI
+from fastapi.middleware.cors import CORSMiddleware
+
+from app.config import settings
+from app.dependencies import get_current_user
+from app.routers import atms, auth, branches, metrics, reports, service_calls, technicians, users
+
+app = FastAPI(title="CashCow API")
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=settings.cors_origins,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+# Public: login
+app.include_router(auth.router)
+
+# Everything else requires a login. Each route then adds its own role rules
+# (see require_roles in dependencies.py), so this is the safety net underneath them.
+protected = [Depends(get_current_user)]
+app.include_router(branches.router, dependencies=protected)
+app.include_router(technicians.router, dependencies=protected)
+app.include_router(atms.router, dependencies=protected)
+app.include_router(service_calls.router, dependencies=protected)
+app.include_router(reports.router, dependencies=protected)
+app.include_router(metrics.router, dependencies=protected)
+app.include_router(users.router, dependencies=protected)
+
+
+@app.get("/health", tags=["health"])
+def health():
+    return {"status": "ok"}
+```
+
+**20h. The `create_user` script now needs a role.** It replaces the version from Step 12:
+
+**`backend/app/create_user.py`**
+
+```python
+import argparse
+import getpass
+import sys
+
+from sqlalchemy import select
+
+from app.database import SessionLocal
+from app.models import Technician, User
+from app.models.enums import UserRole
+from app.security import hash_password
+
+ROLES = {
+    "admin": UserRole.ADMIN,
+    "technician": UserRole.TECHNICIAN,
+    "auditor": UserRole.AUDITOR,
+}
+
+
+def main():
+    parser = argparse.ArgumentParser(description="Create a CashCow user")
+    parser.add_argument("email")
+    parser.add_argument("full_name")
+    parser.add_argument("--role", required=True, choices=ROLES)
+    parser.add_argument(
+        "--technician-id",
+        type=int,
+        help="the technician this login belongs to (required for the technician role)",
+    )
+    args = parser.parse_args()
+
+    role = ROLES[args.role]
+    if role == UserRole.TECHNICIAN and args.technician_id is None:
+        sys.exit("The technician role requires --technician-id")
+    if role != UserRole.TECHNICIAN and args.technician_id is not None:
+        sys.exit("--technician-id is only for the technician role")
+
+    password = getpass.getpass("Password: ")
+    if getpass.getpass("Confirm password: ") != password:
+        sys.exit("Passwords do not match")
+    if len(password) < 8:
+        sys.exit("Password must be at least 8 characters")
+
+    email = args.email.lower()
+    try:
+        hashed = hash_password(password)
+    except ValueError as error:
+        sys.exit(str(error))
+
+    with SessionLocal() as db:
+        if db.scalar(select(User).where(User.email == email)):
+            sys.exit(f"A user with email {email} already exists")
+        if args.technician_id is not None:
+            if db.get(Technician, args.technician_id) is None:
+                sys.exit(f"There is no technician with id {args.technician_id}")
+            if db.scalar(select(User).where(User.technician_id == args.technician_id)):
+                sys.exit(f"Technician {args.technician_id} already has a login")
+        db.add(
+            User(
+                email=email,
+                full_name=args.full_name,
+                hashed_password=hashed,
+                role=role,
+                technician_id=args.technician_id,
+            )
+        )
+        db.commit()
+    print(f"Created {role.value} {email}")
+
+
+if __name__ == "__main__":
+    main()
+```
+
+Examples (the technician login is linked to technician 3, who has an active call in the sample data):
+
+```bash
+python -m app.create_user auditor@cashcow.com "Test Auditor" --role auditor
+python -m app.create_user tech@cashcow.com "Marcus Lee" --role technician --technician-id 3
+```
+
+**20i. The seed script keeps Admin and Auditor logins.** In `seed.py`, import `delete` from `sqlalchemy` and `User` from the models, and replace the old `TRUNCATE ... CASCADE` statement at the top of `seed()`:
+
+```python
+    # Field Technician logins point at technician rows that are about to be replaced, so they
+    # are removed too. Admin and Auditor accounts are left alone.
+    db.execute(delete(User).where(User.technician_id.is_not(None)))
+    # Delete children before parents, then restart the id counters so ids begin at 1 again.
+    # (TRUNCATE ... CASCADE would also wipe the users table, which references technicians.)
+    for model in (Report, ServiceCall, ATM, Technician, Branch):
+        db.execute(delete(model))
+    for table in ("reports", "service_calls", "atms", "technicians", "branches"):
+        db.execute(text(f"ALTER SEQUENCE {table}_id_seq RESTART WITH 1"))
+```
+
+Re-seeding removes Field Technician logins (their technician rows are replaced); recreate them with `create_user`.
+
+**20j. Verify.** Restart the backend, reload the sample data, and sign in at `/docs` as each role (Authorize with each token):
+
+| As | Request | Expected |
+|---|---|---|
+| Auditor | `GET /metrics/dashboard`, `GET /atms` | `200` |
+| Auditor | `PATCH /atms/1`, `POST /branches`, `GET /users` | `403` |
+| Technician | `GET /atms` | one ATM only |
+| Technician | `GET /service-calls` | only their calls |
+| Technician | `GET /metrics/dashboard`, `GET /branches` | `403` |
+| Technician | `GET /atms/1` (not theirs) | `404` |
+| Technician | `PATCH /service-calls/1/status` `{"status":"Completed"}` | `200` |
+| Technician | same call, `{"status":"Pending"}` | `409` (can't move backward) |
+| Technician | `POST /reports` on their call | `201`; on someone else's call `404` |
+| Admin | `DELETE /branches/1` | `409` (still has ATMs) |
+| Admin | `DELETE /users/<your own id>` | `409` |
+| Admin | `GET /auth/me` | includes `"role": "Operations Admin"` |
+
+> **Automated tests (optional, not built here).** This project did not add an automated test suite for these rules. The permission matrix above is exactly what such a suite would encode: one test per (endpoint, role) pair, each expecting `200`, `403`, `404` or `409`, run against a separate test database. If you build one, use `pytest` with FastAPI's `TestClient`, point it at a database whose name ends in `test` so it can never touch real data, and check that the suite *fails* if you deliberately weaken a rule (for example by letting Technicians read branches).
+
+---
+
+### Step 21 ✅ — Role-aware frontend
+
+**Why:** The API now enforces roles (Step 20), so the frontend should stop showing people things they can't use. A Field Technician gets their own work screens; an Auditor sees everything read-only. (The Admin's create/edit/delete screens come in Step 22.)
+
+**Concepts:**
+
+- **Hiding is not security.** Everything here only controls what is *shown*. A technician who typed `/branches` into the API directly would still get `403`, because Step 20 enforces the rules on the server. The frontend just avoids showing buttons that can't work.
+- **`RequireRole`** is a route guard like `ProtectedRoute`, but for roles: `<Route element={<RequireRole roles={[...]} />}>`. A role that isn't listed is sent to its own home page.
+- **One place for role knowledge** (`roles.js`): the role names, each role's home page and each role's navigation links. Pages ask it instead of repeating `if (role === ...)` everywhere.
+- **Reused pages.** Technicians use the same ATMs and Service Calls pages. The API already returns only their data, so the pages change titles and add an Actions column. There is no second copy of the code.
+- **MUI `Dialog` and `Snackbar`.** A Dialog is a pop-up window over the page. A Snackbar is a brief notice at the bottom of the screen ("Report attached").
+- **Mirrored rules.** The Start / Complete / Fail buttons follow the same step rules as the backend. If they ever disagree, the server wins and the page shows its `409` message.
+
+**21a. Roles in one place.** Create `frontend/src/roles.js`:
+
+```js
+// The three roles, spelled exactly as the API sends them
+export const ROLES = {
+  ADMIN: 'Operations Admin',
+  TECHNICIAN: 'Field Technician',
+  AUDITOR: 'Auditor',
+}
+
+// Where each role lands after logging in
+export function homePathFor(role) {
+  return role === ROLES.TECHNICIAN ? '/service-calls' : '/'
+}
+
+// The navigation links each role sees. This only controls what is SHOWN: the API enforces
+// the real rules, so hiding a link here never replaces a check on the server.
+export function navItemsFor(role) {
+  if (role === ROLES.TECHNICIAN) {
+    return [
+      { label: 'My service calls', to: '/service-calls' },
+      { label: 'My ATMs', to: '/atms' },
+    ]
+  }
+  return [
+    { label: 'Dashboard', to: '/' },
+    { label: 'ATMs', to: '/atms' },
+    { label: 'Service Calls', to: '/service-calls' },
+  ]
+}
+```
+
+**21b. The route guard** `frontend/src/RequireRole.jsx`:
+
+**`frontend/src/RequireRole.jsx`**
+
+```jsx
+import { Navigate, Outlet } from 'react-router'
+
+import { useAuth } from './AuthContext.jsx'
+import { homePathFor } from './roles.js'
+
+// Place inside ProtectedRoute. Lets only the listed roles see the nested pages;
+// everyone else is sent to their own home page.
+export default function RequireRole({ roles }) {
+  const { user } = useAuth()
+  if (!roles.includes(user.role)) {
+    return <Navigate to={homePathFor(user.role)} replace />
+  }
+  return <Outlet />
+}
+```
+
+**21c. Technician actions.** The buttons offered on a service call depend on its status:
+
+**`frontend/src/components/ServiceCallActions.jsx`**
+
+```jsx
+import { Box, Button } from '@mui/material'
+
+// The next steps a Field Technician may take. The API enforces this too (409 otherwise).
+const NEXT_STEPS = {
+  Pending: [{ label: 'Start', status: 'In-Progress' }],
+  'In-Progress': [
+    { label: 'Complete', status: 'Completed' },
+    { label: 'Fail', status: 'Failed', color: 'error' },
+  ],
+}
+
+export default function ServiceCallActions({ call, onChangeStatus, onOpenReports }) {
+  const steps = NEXT_STEPS[call.status] ?? []
+
+  return (
+    <Box sx={{ display: 'flex', gap: 1, alignItems: 'center', height: '100%' }}>
+      {steps.map((step) => (
+        <Button
+          key={step.status}
+          size="small"
+          variant="contained"
+          color={step.color ?? 'primary'}
+          onClick={() => onChangeStatus(call, step.status)}
+        >
+          {step.label}
+        </Button>
+      ))}
+      <Button size="small" variant="outlined" onClick={() => onOpenReports(call)}>
+        Reports
+      </Button>
+    </Box>
+  )
+}
+```
+
+**21d. Reports dialog.** A report stores a **link** to the diagnostic file (we have no file upload). The `type="url"` input makes the browser check the format before submitting:
+
+**`frontend/src/components/ReportDialog.jsx`**
+
+```jsx
+import {
+  Alert,
+  Box,
+  Button,
+  CircularProgress,
+  Dialog,
+  DialogActions,
+  DialogContent,
+  DialogTitle,
+  Divider,
+  Link,
+  List,
+  ListItem,
+  ListItemText,
+  TextField,
+  Typography,
+} from '@mui/material'
+import { useState } from 'react'
+
+import { apiFetch } from '../api.js'
+import { useApi } from '../hooks/useApi.js'
+
+// Lists the reports attached to one service call and lets a technician attach another.
+// A report stores a link to the diagnostic file (we don't upload files).
+export default function ReportDialog({ serviceCall, onClose, onNotice }) {
+  const { data, loading, error, reload } = useApi('/reports')
+  const [fileUrl, setFileUrl] = useState('')
+  const [notes, setNotes] = useState('')
+  const [submitting, setSubmitting] = useState(false)
+  const [formError, setFormError] = useState('')
+
+  // The API already limits this list to the technician's own reports; keep this call's
+  const reports = (data ?? []).filter((report) => report.service_call_id === serviceCall.id)
+
+  async function handleSubmit(event) {
+    event.preventDefault()
+    setFormError('')
+    setSubmitting(true)
+    try {
+      await apiFetch('/reports', {
+        method: 'POST',
+        body: JSON.stringify({
+          file_url: fileUrl,
+          notes: notes.trim() || null,
+          service_call_id: serviceCall.id,
+        }),
+      })
+      setFileUrl('')
+      setNotes('')
+      reload()
+      onNotice({ severity: 'success', message: 'Report attached' })
+    } catch (err) {
+      setFormError(err.message)
+    } finally {
+      setSubmitting(false)
+    }
+  }
+
+  return (
+    <Dialog open onClose={onClose} fullWidth maxWidth="sm">
+      <DialogTitle>Reports: {serviceCall.title}</DialogTitle>
+      <DialogContent>
+        {error && <Alert severity="error">{error}</Alert>}
+        {loading && !data && <CircularProgress size={24} />}
+        {data && reports.length === 0 && (
+          <Typography color="text.secondary">No reports attached yet.</Typography>
+        )}
+        <List dense>
+          {reports.map((report) => (
+            <ListItem key={report.id} disableGutters>
+              <ListItemText
+                primary={
+                  <Link href={report.file_url} target="_blank" rel="noopener noreferrer">
+                    {report.file_url}
+                  </Link>
+                }
+                secondary={`${new Date(report.timestamp).toLocaleString()}${report.notes ? ` · ${report.notes}` : ''}`}
+              />
+            </ListItem>
+          ))}
+        </List>
+
+        <Divider sx={{ my: 2 }} />
+        <Typography variant="subtitle1" gutterBottom>
+          Attach a report
+        </Typography>
+        <Box
+          component="form"
+          onSubmit={handleSubmit}
+          sx={{ display: 'flex', flexDirection: 'column', gap: 2 }}
+        >
+          {formError && <Alert severity="error">{formError}</Alert>}
+          <TextField
+            label="Link to diagnostic file"
+            type="url"
+            value={fileUrl}
+            onChange={(event) => setFileUrl(event.target.value)}
+            placeholder="https://..."
+            required
+            size="small"
+          />
+          <TextField
+            label="Notes (optional)"
+            value={notes}
+            onChange={(event) => setNotes(event.target.value)}
+            multiline
+            minRows={2}
+            size="small"
+          />
+          <Button type="submit" variant="contained" disabled={submitting}>
+            {submitting ? 'Attaching...' : 'Attach report'}
+          </Button>
+        </Box>
+      </DialogContent>
+      <DialogActions>
+        <Button onClick={onClose}>Close</Button>
+      </DialogActions>
+    </Dialog>
+  )
+}
+```
+
+**21e. Layout and routes.** The top bar shows the links for the user's role and a badge with the role name. The dashboard is the only page behind `RequireRole`; ATMs and Service Calls are open to every role because the API already limits what each one gets back.
+
+**`frontend/src/components/Layout.jsx`**
+
+```jsx
+import { AppBar, Box, Button, Chip, Container, Toolbar, Typography } from '@mui/material'
+import { NavLink, Outlet } from 'react-router'
+
+import { useAuth } from '../AuthContext.jsx'
+import { navItemsFor } from '../roles.js'
+
+export default function Layout() {
+  const { user, logout } = useAuth()
+
+  return (
+    <Box sx={{ minHeight: '100vh', bgcolor: 'grey.100' }}>
+      <AppBar position="static">
+        <Toolbar>
+          <Typography variant="h6" sx={{ mr: 4 }}>
+            CashCow
+          </Typography>
+          <Box sx={{ flexGrow: 1, display: 'flex', gap: 1 }}>
+            {navItemsFor(user.role).map((item) => (
+              <Button
+                key={item.to}
+                color="inherit"
+                component={NavLink}
+                to={item.to}
+                end
+                sx={{ '&.active': { bgcolor: 'rgba(255, 255, 255, 0.18)' } }}
+              >
+                {item.label}
+              </Button>
+            ))}
+          </Box>
+          <Chip
+            label={user.role}
+            size="small"
+            variant="outlined"
+            sx={{ mr: 2, color: 'inherit', borderColor: 'rgba(255, 255, 255, 0.6)' }}
+          />
+          <Typography variant="body2" sx={{ mr: 2 }}>
+            {user.full_name}
+          </Typography>
+          <Button color="inherit" onClick={logout}>
+            Log out
+          </Button>
+        </Toolbar>
+      </AppBar>
+      <Container maxWidth="lg" sx={{ py: 4 }}>
+        <Outlet />
+      </Container>
+    </Box>
+  )
+}
+```
+
+```jsx
+// frontend/src/App.jsx (as of this step; Step 22 extends it)
+import { BrowserRouter, Navigate, Route, Routes } from 'react-router'
+
+import { AuthProvider } from './AuthContext.jsx'
+import ProtectedRoute from './ProtectedRoute.jsx'
+import RequireRole from './RequireRole.jsx'
+import Layout from './components/Layout.jsx'
+import AtmsPage from './pages/AtmsPage.jsx'
+import DashboardPage from './pages/DashboardPage.jsx'
+import LoginPage from './pages/LoginPage.jsx'
+import ServiceCallsPage from './pages/ServiceCallsPage.jsx'
+import { ROLES } from './roles.js'
+
+export default function App() {
+  return (
+    <BrowserRouter>
+      <AuthProvider>
+        <Routes>
+          <Route path="/login" element={<LoginPage />} />
+          <Route element={<ProtectedRoute />}>
+            <Route element={<Layout />}>
+              <Route element={<RequireRole roles={[ROLES.ADMIN, ROLES.AUDITOR]} />}>
+                <Route path="/" element={<DashboardPage />} />
+              </Route>
+              <Route path="/atms" element={<AtmsPage />} />
+              <Route path="/service-calls" element={<ServiceCallsPage />} />
+            </Route>
+          </Route>
+          <Route path="*" element={<Navigate to="/" replace />} />
+        </Routes>
+      </AuthProvider>
+    </BrowserRouter>
+  )
+}
+```
+
+**21f. Titles and technician actions on the two pages.** In `AtmsPage.jsx`, the heading and search label depend on the role (`isTechnician ? 'My ATMs' : 'ATMs'`). In `ServiceCallsPage.jsx`, a Field Technician gets an extra **Actions** column (Start, Complete, Fail, Reports) and a notice (Snackbar) after each action, while the Technician column is dropped because every row would repeat their own name. In Step 22 these two pages are rewritten, so the final versions are shown there.
+
+**21g. Try it.** Create one login per role (Step 20h), re-seed if needed, and sign in as each:
+
+1. **Technician:** you land on **My service calls** with only your own calls. Click **Reports**, paste any link such as `https://example.com/diag.pdf`, and attach it. Click **Complete** on an In-Progress call: a notice confirms it and the Complete/Fail buttons disappear. **My ATMs** is then empty if you have no active calls left (by design, a technician sees only ATMs with an *active* call).
+2. **Auditor:** Dashboard, ATMs and Service Calls, with no Actions column and no buttons.
+3. Typing `/` as a technician sends you back to your own page.
+
+---
+
+### Step 22 ✅ — Admin management screens (create, edit, delete)
+
+**Why:** The Admin needs to manage branches, technicians, ATMs, service calls and user accounts from the UI, not only through `/docs`. The Auditor gets read-only Branches and Technicians pages.
+
+**Design: one reusable page, many entities.** Writing five separate pages with their own grids, forms and delete confirmations would repeat almost everything. Instead:
+
+- **`CrudPage`** is a complete "list of records" page: a searchable grid and, for Admins, Add / Edit / Delete with a form and a confirmation, plus notices. Each entity just *describes itself*: its columns, its form fields, and how to turn form values into the JSON the API wants.
+- **Props as configuration.** A component receives settings as props (`columns`, `getFields`, `toPayload`, `canManage`, ...) instead of hardcoding one entity. Adding another entity later is ~40 lines.
+- **`FormDialog`** builds a form from a list of field descriptions (`{ name, label, type, required, options, visible, ... }`). `visible(values)` is how a field can appear only when another field has a certain value (the Technician dropdown on the Users form appears only for the Field Technician role).
+- **Two layers of validation.** The form checks the easy things (required, the 5-digit pattern, number ranges) for instant feedback. The API checks again and is the real authority; its error messages (such as "Branch still has ATMs") appear inside the dialog.
+- **`canManage` only hides buttons.** The API decides what is allowed, so even forced buttons would get `403`.
+- **Dropdowns load only when needed.** `useApi` gained a `{ skip: true }` option so only Admins (who have forms) fetch the branch, ATM and technician lists.
+- **Stable identities.** `columns` and `describeRow` passed to `CrudPage` are defined at module level or in `useMemo`, so the grid doesn't rebuild its columns on every keystroke.
+
+No backend changes and no new packages are needed in this step.
+
+**22a. Constants and two small fixes.** `frontend/src/constants.js`:
+
+**`frontend/src/constants.js`**
+
+```js
+// The allowed values for fields with a fixed set of choices (the same ones the API accepts)
+export const ATM_STATUSES = ['Operational', 'In-Transport', 'Maintenance', 'Offline']
+export const PRIORITIES = ['Low', 'Medium', 'Critical']
+export const SERVICE_STATUSES = ['Pending', 'In-Progress', 'Completed', 'Failed']
+
+// Turn a list of plain values into the { value, label } options a form dropdown needs
+export const toOptions = (values) => values.map((value) => ({ value, label: value }))
+```
+
+In `frontend/src/api.js`, a successful delete answers `204` with no body, which `response.json()` cannot parse. Change the last line of `apiFetch`:
+
+```js
+  // A successful DELETE answers 204 with no body
+  if (response.status === 204) return null
+  return response.json()}
+```
+
+`useApi` gains the `skip` option:
+
+**`frontend/src/hooks/useApi.js`**
+
+```js
+import { useCallback, useEffect, useState } from 'react'
+
+import { apiFetch } from '../api.js'
+
+// Loads data from the API when the component first appears, and offers reload().
+// Pass { skip: true } to not load anything (for data this user has no use for).
+export function useApi(path, { skip = false } = {}) {
+  const [data, setData] = useState(null)
+  const [loading, setLoading] = useState(!skip)
+  const [error, setError] = useState('')
+  const [reloadCount, setReloadCount] = useState(0)
+
+  useEffect(() => {
+    if (skip) return undefined
+    // If the component goes away (or a newer request starts), ignore this request's result
+    let ignore = false
+    apiFetch(path)
+      .then((result) => {
+        if (ignore) return
+        setData(result)
+        setError('')
+      })
+      .catch((err) => {
+        if (!ignore) setError(err.message)
+      })
+      .finally(() => {
+        if (!ignore) setLoading(false)
+      })
+    return () => {
+      ignore = true
+    }
+  }, [path, reloadCount, skip])
+
+  const reload = useCallback(() => {
+    setLoading(true)
+    setReloadCount((count) => count + 1)
+  }, [])
+
+  return { data, loading, error, reload }
+}
+```
+
+`roles.js` now offers more navigation links: the Auditor and Admin also see Branches and Technicians, and the Admin sees Users:
+
+**`frontend/src/roles.js`**
+
+```js
+// The three roles, spelled exactly as the API sends them
+export const ROLES = {
+  ADMIN: 'Operations Admin',
+  TECHNICIAN: 'Field Technician',
+  AUDITOR: 'Auditor',
+}
+
+// Where each role lands after logging in
+export function homePathFor(role) {
+  return role === ROLES.TECHNICIAN ? '/service-calls' : '/'
+}
+
+// The navigation links each role sees. This only controls what is SHOWN: the API enforces
+// the real rules, so hiding a link here never replaces a check on the server.
+export function navItemsFor(role) {
+  if (role === ROLES.TECHNICIAN) {
+    return [
+      { label: 'My service calls', to: '/service-calls' },
+      { label: 'My ATMs', to: '/atms' },
+    ]
+  }
+  const items = [
+    { label: 'Dashboard', to: '/' },
+    { label: 'ATMs', to: '/atms' },
+    { label: 'Service Calls', to: '/service-calls' },
+    { label: 'Branches', to: '/branches' },
+    { label: 'Technicians', to: '/technicians' },
+  ]
+  if (role === ROLES.ADMIN) items.push({ label: 'Users', to: '/users' })
+  return items
+}
+```
+
+**22b. The shared building blocks.**
+
+**`frontend/src/components/FormDialog.jsx`**
+
+```jsx
+import { Alert, Button, Dialog, DialogActions, DialogContent, DialogTitle, MenuItem, TextField } from '@mui/material'
+import { useState } from 'react'
+
+// A dropdown that has an "Unassigned"-style option whose value is '' must still show that
+// option's text, instead of looking empty
+const hasEmptyOption = (field) =>
+  field.type === 'select' && field.options.some((option) => option.value === '')
+
+function FormField({ field, value, onChange }) {
+  const showsEmptyOption = hasEmptyOption(field)
+  return (
+    <TextField
+      label={field.label}
+      value={value}
+      onChange={(event) => onChange(field.name, event.target.value)}
+      select={field.type === 'select'}
+      type={field.type === 'select' ? undefined : (field.type ?? 'text')}
+      required={field.required}
+      disabled={field.disabled}
+      helperText={field.helperText}
+      size="small"
+      fullWidth
+      slotProps={{
+        htmlInput: { min: field.min, max: field.max, step: field.step, pattern: field.pattern },
+        select: { displayEmpty: showsEmptyOption },
+        inputLabel: { shrink: showsEmptyOption || undefined },
+      }}
+    >
+      {field.type === 'select' &&
+        field.options.map((option) => (
+          <MenuItem key={option.value} value={option.value}>
+            {option.label}
+          </MenuItem>
+        ))}
+    </TextField>
+  )
+}
+
+// A pop-up form built from a list of field descriptions. Each field looks like:
+//   { name, label, type, required, disabled, helperText, options, visible, defaultValue,
+//     min, max, step, pattern }
+// type is 'text' (default), 'number', 'email', 'password' or 'select' (give it options).
+// visible(values) can hide a field depending on what is typed in the others.
+// onSubmit(values) should throw an Error if the save fails; its message is shown in the form.
+export default function FormDialog({ title, fields, initialValues, submitLabel = 'Save', onSubmit, onClose }) {
+  const [values, setValues] = useState(() =>
+    Object.fromEntries(
+      fields.map((field) => [field.name, initialValues[field.name] ?? field.defaultValue ?? '']),
+    ),
+  )
+  const [error, setError] = useState('')
+  const [submitting, setSubmitting] = useState(false)
+
+  const setValue = (name, value) => setValues((current) => ({ ...current, [name]: value }))
+
+  async function handleSubmit(event) {
+    event.preventDefault()
+    setError('')
+    setSubmitting(true)
+    try {
+      await onSubmit(values) // on success the page closes this dialog
+    } catch (err) {
+      setError(err.message)
+      setSubmitting(false)
+    }
+  }
+
+  return (
+    <Dialog
+      open
+      onClose={submitting ? undefined : onClose}
+      fullWidth
+      maxWidth="xs"
+      slotProps={{ paper: { component: 'form', onSubmit: handleSubmit } }}
+    >
+      <DialogTitle>{title}</DialogTitle>
+      <DialogContent sx={{ display: 'flex', flexDirection: 'column', gap: 2, pt: '8px !important' }}>
+        {error && <Alert severity="error">{error}</Alert>}
+        {fields
+          .filter((field) => !field.visible || field.visible(values))
+          .map((field) => (
+            <FormField key={field.name} field={field} value={values[field.name]} onChange={setValue} />
+          ))}
+      </DialogContent>
+      <DialogActions>
+        <Button onClick={onClose} disabled={submitting}>
+          Cancel
+        </Button>
+        <Button type="submit" variant="contained" disabled={submitting}>
+          {submitting ? 'Saving...' : submitLabel}
+        </Button>
+      </DialogActions>
+    </Dialog>
+  )
+}
+```
+
+**`frontend/src/components/ConfirmDialog.jsx`**
+
+```jsx
+import { Alert, Button, Dialog, DialogActions, DialogContent, DialogContentText, DialogTitle } from '@mui/material'
+import { useState } from 'react'
+
+// "Are you sure?" pop-up. onConfirm() may throw an Error; its message is shown here
+// (for example "Branch still has ATMs"). On success the page closes this dialog.
+export default function ConfirmDialog({ title, message, confirmLabel = 'Delete', onConfirm, onClose }) {
+  const [error, setError] = useState('')
+  const [busy, setBusy] = useState(false)
+
+  async function handleConfirm() {
+    setError('')
+    setBusy(true)
+    try {
+      await onConfirm()
+    } catch (err) {
+      setError(err.message)
+      setBusy(false)
+    }
+  }
+
+  return (
+    <Dialog open onClose={busy ? undefined : onClose} fullWidth maxWidth="xs">
+      <DialogTitle>{title}</DialogTitle>
+      <DialogContent>
+        {error && (
+          <Alert severity="error" sx={{ mb: 2 }}>
+            {error}
+          </Alert>
+        )}
+        <DialogContentText>{message}</DialogContentText>
+      </DialogContent>
+      <DialogActions>
+        <Button onClick={onClose} disabled={busy}>
+          Cancel
+        </Button>
+        <Button onClick={handleConfirm} color="error" variant="contained" disabled={busy}>
+          {busy ? 'Working...' : confirmLabel}
+        </Button>
+      </DialogActions>
+    </Dialog>
+  )
+}
+```
+
+**`frontend/src/components/CrudPage.jsx`**
+
+```jsx
+import AddIcon from '@mui/icons-material/Add'
+import DeleteIcon from '@mui/icons-material/Delete'
+import EditIcon from '@mui/icons-material/Edit'
+import RefreshIcon from '@mui/icons-material/Refresh'
+import { Alert, Box, Button, IconButton, Snackbar, Tooltip, Typography } from '@mui/material'
+import { useMemo, useState } from 'react'
+
+import { apiFetch } from '../api.js'
+import { useApi } from '../hooks/useApi.js'
+import ConfirmDialog from './ConfirmDialog.jsx'
+import DataTable from './DataTable.jsx'
+import FormDialog from './FormDialog.jsx'
+
+// A complete "list of records" page: a searchable grid and, when canManage is true,
+// Add / Edit / Delete with a form and a confirmation. The API enforces who may really
+// change things; canManage only decides whether the buttons are shown.
+//
+//   title, singular   "Branches", "branch"
+//   path              the API address, e.g. '/branches'
+//   columns           the grid columns (an Actions column is added when canManage)
+//   getFields(row)    the form fields; row is the record being edited, or null when adding
+//   toFormValues(row) turn a record into starting form values (default: use the record as is)
+//   toPayload(values, row) turn the form values into the JSON the API expects;
+//                     row is the record being edited, or null when adding
+//   describeRow(row)  a short name for a record, used in messages
+//   ready             set false while data the form needs (dropdown options) is still loading
+export default function CrudPage({
+  title,
+  singular,
+  path,
+  columns,
+  getFields,
+  toFormValues = (row) => row,
+  toPayload,
+  describeRow,
+  canManage,
+  ready = true,
+  searchLabel,
+  pageSize,
+}) {
+  const { data, loading, error, reload } = useApi(path)
+  const [dialog, setDialog] = useState(null) // { mode: 'create' | 'edit' | 'delete', row }
+  const [notice, setNotice] = useState(null)
+
+  const allColumns = useMemo(() => {
+    if (!canManage) return columns
+    return [
+      ...columns,
+      {
+        field: 'actions',
+        headerName: '',
+        width: 110,
+        sortable: false,
+        filterable: false,
+        disableColumnMenu: true,
+        renderCell: (params) => (
+          <Box sx={{ display: 'flex', alignItems: 'center', height: '100%' }}>
+            <Tooltip title="Edit">
+              <IconButton
+                size="small"
+                aria-label={`Edit ${describeRow(params.row)}`}
+                onClick={() => setDialog({ mode: 'edit', row: params.row })}
+              >
+                <EditIcon fontSize="small" />
+              </IconButton>
+            </Tooltip>
+            <Tooltip title="Delete">
+              <IconButton
+                size="small"
+                color="error"
+                aria-label={`Delete ${describeRow(params.row)}`}
+                onClick={() => setDialog({ mode: 'delete', row: params.row })}
+              >
+                <DeleteIcon fontSize="small" />
+              </IconButton>
+            </Tooltip>
+          </Box>
+        ),
+      },
+    ]
+  }, [canManage, columns, describeRow])
+
+  async function save(values) {
+    const body = JSON.stringify(toPayload(values, dialog.mode === 'edit' ? dialog.row : null))
+    if (dialog.mode === 'create') {
+      await apiFetch(path, { method: 'POST', body })
+      setNotice({ severity: 'success', message: `Added ${singular}` })
+    } else {
+      await apiFetch(`${path}/${dialog.row.id}`, { method: 'PATCH', body })
+      setNotice({ severity: 'success', message: `Saved ${describeRow(dialog.row)}` })
+    }
+    setDialog(null)
+    reload()
+  }
+
+  async function remove() {
+    await apiFetch(`${path}/${dialog.row.id}`, { method: 'DELETE' })
+    setNotice({ severity: 'success', message: `Deleted ${describeRow(dialog.row)}` })
+    setDialog(null)
+    reload()
+  }
+
+  const editing = dialog?.mode === 'edit' ? dialog.row : null
+
+  return (
+    <Box>
+      <Box sx={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', mb: 3 }}>
+        <Typography variant="h4">{title}</Typography>
+        <Box sx={{ display: 'flex', gap: 1 }}>
+          {canManage && (
+            <Button
+              variant="contained"
+              startIcon={<AddIcon />}
+              disabled={!ready}
+              onClick={() => setDialog({ mode: 'create', row: null })}
+            >
+              Add {singular}
+            </Button>
+          )}
+          <Button variant="outlined" startIcon={<RefreshIcon />} onClick={reload} disabled={loading}>
+            Refresh
+          </Button>
+        </Box>
+      </Box>
+
+      <DataTable
+        rows={data ?? []}
+        columns={allColumns}
+        loading={loading}
+        error={error}
+        searchLabel={searchLabel}
+        pageSize={pageSize}
+      />
+
+      {(dialog?.mode === 'create' || dialog?.mode === 'edit') && (
+        <FormDialog
+          title={dialog.mode === 'create' ? `Add ${singular}` : `Edit ${describeRow(dialog.row)}`}
+          fields={getFields(editing)}
+          initialValues={editing ? toFormValues(editing) : {}}
+          onSubmit={save}
+          onClose={() => setDialog(null)}
+        />
+      )}
+      {dialog?.mode === 'delete' && (
+        <ConfirmDialog
+          title={`Delete ${singular}?`}
+          message={`This permanently deletes ${describeRow(dialog.row)}.`}
+          onConfirm={remove}
+          onClose={() => setDialog(null)}
+        />
+      )}
+      <Snackbar
+        open={notice !== null}
+        autoHideDuration={4000}
+        onClose={() => setNotice(null)}
+        anchorOrigin={{ vertical: 'bottom', horizontal: 'center' }}
+      >
+        {notice ? (
+          <Alert severity={notice.severity} onClose={() => setNotice(null)} variant="filled">
+            {notice.message}
+          </Alert>
+        ) : undefined}
+      </Snackbar>
+    </Box>
+  )
+}
+```
+
+**22c. The entity pages.** Each one only describes its data.
+
+**`frontend/src/pages/BranchesPage.jsx`**
+
+```jsx
+import CrudPage from '../components/CrudPage.jsx'
+import { useAuth } from '../AuthContext.jsx'
+import { ROLES } from '../roles.js'
+
+const COLUMNS = [
+  { field: 'name', headerName: 'Name', flex: 1, minWidth: 160 },
+  { field: 'region', headerName: 'Region', flex: 1, minWidth: 140 },
+  { field: 'capacity', headerName: 'Capacity', type: 'number', width: 110 },
+  { field: 'supervisor_id', headerName: 'Supervisor ID', type: 'number', width: 140 },
+]
+
+const getFields = () => [
+  { name: 'name', label: 'Name', required: true },
+  { name: 'region', label: 'Region', required: true },
+  { name: 'capacity', label: 'Capacity', type: 'number', required: true, min: 1 },
+  { name: 'supervisor_id', label: 'Supervisor ID', type: 'number', required: true },
+]
+
+const toPayload = (values) => ({
+  name: values.name,
+  region: values.region,
+  capacity: Number(values.capacity),
+  supervisor_id: Number(values.supervisor_id),
+})
+
+const describeRow = (row) => `branch ${row.name}`
+
+export default function BranchesPage() {
+  const { user } = useAuth()
+  return (
+    <CrudPage
+      title="Branches"
+      singular="branch"
+      path="/branches"
+      columns={COLUMNS}
+      getFields={getFields}
+      toPayload={toPayload}
+      describeRow={describeRow}
+      canManage={user.role === ROLES.ADMIN}
+      searchLabel="Search branches"
+    />
+  )
+}
+```
+
+The API returns only a `branch_id` for technicians, so the grid looks the branch name up in the branches list that the form dropdown needs anyway:
+
+**`frontend/src/pages/TechniciansPage.jsx`**
+
+```jsx
+import { useMemo } from 'react'
+
+import { useAuth } from '../AuthContext.jsx'
+import CrudPage from '../components/CrudPage.jsx'
+import { useApi } from '../hooks/useApi.js'
+import { ROLES } from '../roles.js'
+
+const toPayload = (values) => ({ name: values.name, branch_id: Number(values.branch_id) })
+const describeRow = (row) => `technician ${row.name}`
+
+export default function TechniciansPage() {
+  const { user } = useAuth()
+  const { data: branches, loading: branchesLoading } = useApi('/branches')
+
+  // The API returns branch_id only, so look the branch name up in the branches list
+  const columns = useMemo(() => {
+    const branchNames = Object.fromEntries((branches ?? []).map((branch) => [branch.id, branch.name]))
+    return [
+      { field: 'name', headerName: 'Name', flex: 1, minWidth: 180 },
+      {
+        field: 'branch_id',
+        headerName: 'Branch',
+        flex: 1,
+        minWidth: 160,
+        valueGetter: (value) => branchNames[value] ?? '',
+      },
+    ]
+  }, [branches])
+
+  const getFields = () => [
+    { name: 'name', label: 'Name', required: true },
+    {
+      name: 'branch_id',
+      label: 'Branch',
+      type: 'select',
+      required: true,
+      options: (branches ?? []).map((branch) => ({ value: branch.id, label: branch.name })),
+    },
+  ]
+
+  return (
+    <CrudPage
+      title="Technicians"
+      singular="technician"
+      path="/technicians"
+      columns={columns}
+      getFields={getFields}
+      toPayload={toPayload}
+      describeRow={describeRow}
+      canManage={user.role === ROLES.ADMIN}
+      ready={!branchesLoading}
+      searchLabel="Search technicians"
+    />
+  )
+}
+```
+
+On the Users form the role decides whether the technician link applies, and the password is optional when editing:
+
+**`frontend/src/pages/UsersPage.jsx`**
+
+```jsx
+import { useMemo } from 'react'
+
+import { useAuth } from '../AuthContext.jsx'
+import CrudPage from '../components/CrudPage.jsx'
+import { useApi } from '../hooks/useApi.js'
+import { ROLES } from '../roles.js'
+
+const ROLE_OPTIONS = Object.values(ROLES).map((role) => ({ value: role, label: role }))
+const describeRow = (row) => `user ${row.email}`
+
+// Only a Field Technician login is linked to a technician; other roles are not
+const technicianIdFor = (values) =>
+  values.role === ROLES.TECHNICIAN ? Number(values.technician_id) : null
+
+// row is the user being edited, or null when adding one
+function toPayload(values, row) {
+  if (row === null) {
+    return {
+      email: values.email,
+      full_name: values.full_name,
+      password: values.password,
+      role: values.role,
+      technician_id: technicianIdFor(values),
+    }
+  }
+  return {
+    full_name: values.full_name,
+    role: values.role,
+    technician_id: technicianIdFor(values),
+    // Leave the password out entirely unless a new one was typed
+    ...(values.password ? { password: values.password } : {}),
+  }
+}
+
+export default function UsersPage() {
+  const { user } = useAuth()
+  const { data: technicians, loading: techniciansLoading } = useApi('/technicians')
+
+  const columns = useMemo(() => {
+    const technicianNames = Object.fromEntries((technicians ?? []).map((t) => [t.id, t.name]))
+    return [
+      { field: 'email', headerName: 'Email', flex: 1.2, minWidth: 220 },
+      { field: 'full_name', headerName: 'Name', flex: 1, minWidth: 160 },
+      { field: 'role', headerName: 'Role', width: 170 },
+      {
+        field: 'technician_id',
+        headerName: 'Linked technician',
+        flex: 1,
+        minWidth: 160,
+        valueGetter: (value) => (value === null ? '' : (technicianNames[value] ?? '')),
+      },
+    ]
+  }, [technicians])
+
+  const getFields = (row) => [
+    { name: 'email', label: 'Email', type: 'email', required: true, disabled: row !== null },
+    { name: 'full_name', label: 'Full name', required: true },
+    { name: 'role', label: 'Role', type: 'select', required: true, options: ROLE_OPTIONS },
+    {
+      name: 'technician_id',
+      label: 'Technician this login belongs to',
+      type: 'select',
+      required: true,
+      options: (technicians ?? []).map((t) => ({ value: t.id, label: t.name })),
+      visible: (values) => values.role === ROLES.TECHNICIAN,
+    },
+    {
+      name: 'password',
+      label: row === null ? 'Password' : 'New password',
+      type: 'password',
+      required: row === null,
+      helperText: row === null ? 'At least 8 characters' : 'Leave blank to keep the current password',
+    },
+  ]
+
+  return (
+    <CrudPage
+      title="Users"
+      singular="user"
+      path="/users"
+      columns={columns}
+      getFields={getFields}
+      toPayload={toPayload}
+      describeRow={describeRow}
+      canManage={user.role === ROLES.ADMIN}
+      ready={!techniciansLoading}
+      searchLabel="Search users"
+    />
+  )
+}
+```
+
+The ATMs page now uses `CrudPage` for every role. Admins get the forms; Auditors and Technicians get the same read-only grid. A serial number is chosen once and never changes, and the cash field enforces the $0 to $10,000 range:
+
+**`frontend/src/pages/AtmsPage.jsx`**
+
+```jsx
+import { useAuth } from '../AuthContext.jsx'
+import CrudPage from '../components/CrudPage.jsx'
+import StatusChip from '../components/StatusChip.jsx'
+import { ATM_STATUSES, toOptions } from '../constants.js'
+import { formatCurrency } from '../format.js'
+import { useApi } from '../hooks/useApi.js'
+import { ROLES } from '../roles.js'
+
+const COLUMNS = [
+  { field: 'serial_number', headerName: 'Serial', width: 110 },
+  { field: 'model', headerName: 'Model', flex: 1, minWidth: 180 },
+  { field: 'branch_name', headerName: 'Branch', flex: 1, minWidth: 130 },
+  {
+    field: 'status',
+    headerName: 'Status',
+    width: 150,
+    renderCell: (params) => <StatusChip status={params.value} />,
+  },
+  {
+    field: 'cash_level',
+    headerName: 'Cash level',
+    type: 'number',
+    width: 130,
+    // The API sends money as text, so convert to a number to sort numerically
+    valueGetter: (value) => Number(value),
+    valueFormatter: (value) => formatCurrency(value),
+  },
+]
+
+const describeRow = (row) => `ATM ${row.serial_number}`
+
+// row is the ATM being edited, or null when adding one
+function toPayload(values, row) {
+  const changeable = {
+    model: values.model,
+    status: values.status,
+    cash_level: values.cash_level,
+    branch_id: Number(values.branch_id),
+  }
+  // A serial number is chosen when the ATM is created and never changes
+  return row === null ? { serial_number: values.serial_number, ...changeable } : changeable
+}
+
+export default function AtmsPage() {
+  const { user } = useAuth()
+  const isTechnician = user.role === ROLES.TECHNICIAN
+  // Only the Admin's Add/Edit form needs the list of branches
+  const { data: branches, loading: branchesLoading } = useApi('/branches', {
+    skip: user.role !== ROLES.ADMIN,
+  })
+
+  const getFields = (row) => [
+    {
+      name: 'serial_number',
+      label: 'Serial number',
+      required: true,
+      disabled: row !== null,
+      pattern: '[0-9]{5}',
+      helperText: 'Exactly 5 digits',
+    },
+    { name: 'model', label: 'Model', required: true },
+    {
+      name: 'status',
+      label: 'Status',
+      type: 'select',
+      required: true,
+      defaultValue: 'Operational',
+      options: toOptions(ATM_STATUSES),
+    },
+    {
+      name: 'cash_level',
+      label: 'Cash level ($)',
+      type: 'number',
+      required: true,
+      defaultValue: '0',
+      min: 0,
+      max: 10000,
+      step: 0.01,
+      helperText: 'Between $0 and $10,000 (a full reserve)',
+    },
+    {
+      name: 'branch_id',
+      label: 'Branch',
+      type: 'select',
+      required: true,
+      options: (branches ?? []).map((branch) => ({ value: branch.id, label: branch.name })),
+    },
+  ]
+
+  return (
+    <CrudPage
+      title={isTechnician ? 'My ATMs' : 'ATMs'}
+      singular="ATM"
+      path="/atms"
+      columns={COLUMNS}
+      getFields={getFields}
+      toPayload={toPayload}
+      describeRow={describeRow}
+      canManage={user.role === ROLES.ADMIN}
+      ready={!branchesLoading}
+      searchLabel={isTechnician ? 'Search my ATMs' : 'Search ATMs'}
+    />
+  )
+}
+```
+
+The technician's service calls page from Step 21 moves to its own file (it is only used by technicians now):
+
+**`frontend/src/pages/TechnicianServiceCallsPage.jsx`**
+
+```jsx
+import RefreshIcon from '@mui/icons-material/Refresh'
+import { Alert, Box, Button, Snackbar, Typography } from '@mui/material'
+import { useCallback, useMemo, useState } from 'react'
+
+import { apiFetch } from '../api.js'
+import DataTable from '../components/DataTable.jsx'
+import ReportDialog from '../components/ReportDialog.jsx'
+import ServiceCallActions from '../components/ServiceCallActions.jsx'
+import StatusChip from '../components/StatusChip.jsx'
+import { useApi } from '../hooks/useApi.js'
+
+const COLUMNS = [
+  { field: 'title', headerName: 'Title', flex: 1.5, minWidth: 220 },
+  {
+    field: 'priority',
+    headerName: 'Priority',
+    width: 120,
+    renderCell: (params) => <StatusChip status={params.value} />,
+  },
+  {
+    field: 'status',
+    headerName: 'Status',
+    width: 140,
+    renderCell: (params) => <StatusChip status={params.value} />,
+  },
+  { field: 'atm_serial_number', headerName: 'ATM', width: 100 },
+  { field: 'atm_model', headerName: 'ATM model', flex: 1, minWidth: 170 },
+  { field: 'branch_name', headerName: 'Branch', flex: 1, minWidth: 120 },
+]
+
+export default function TechnicianServiceCallsPage() {
+  const { data, loading, error, reload } = useApi('/service-calls')
+  const [notice, setNotice] = useState(null)
+  const [reportCall, setReportCall] = useState(null)
+
+  const changeStatus = useCallback(
+    async (call, status) => {
+      try {
+        await apiFetch(`/service-calls/${call.id}/status`, {
+          method: 'PATCH',
+          body: JSON.stringify({ status }),
+        })
+        setNotice({ severity: 'success', message: `"${call.title}" is now ${status}` })
+        reload()
+      } catch (err) {
+        setNotice({ severity: 'error', message: err.message })
+      }
+    },
+    [reload],
+  )
+
+  const columns = useMemo(
+    () => [
+      ...COLUMNS,
+      {
+        field: 'actions',
+        headerName: 'Actions',
+        width: 280,
+        sortable: false,
+        filterable: false,
+        disableColumnMenu: true,
+        renderCell: (params) => (
+          <ServiceCallActions
+            call={params.row}
+            onChangeStatus={changeStatus}
+            onOpenReports={setReportCall}
+          />
+        ),
+      },
+    ],
+    [changeStatus],
+  )
+
+  return (
+    <Box>
+      <Box sx={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', mb: 3 }}>
+        <Typography variant="h4">My service calls</Typography>
+        <Button variant="outlined" startIcon={<RefreshIcon />} onClick={reload} disabled={loading}>
+          Refresh
+        </Button>
+      </Box>
+      <DataTable
+        rows={data ?? []}
+        columns={columns}
+        loading={loading}
+        error={error}
+        searchLabel="Search my service calls"
+        pageSize={5}
+      />
+
+      {reportCall && (
+        <ReportDialog
+          serviceCall={reportCall}
+          onClose={() => setReportCall(null)}
+          onNotice={setNotice}
+        />
+      )}
+      <Snackbar
+        open={notice !== null}
+        autoHideDuration={4000}
+        onClose={() => setNotice(null)}
+        anchorOrigin={{ vertical: 'bottom', horizontal: 'center' }}
+      >
+        {notice ? (
+          <Alert severity={notice.severity} onClose={() => setNotice(null)} variant="filled">
+            {notice.message}
+          </Alert>
+        ) : undefined}
+      </Snackbar>
+    </Box>
+  )
+}
+```
+
+`ServiceCallsPage` picks the right experience for the role. For Admins and Auditors it is a `CrudPage`. A new call always starts as Pending, so Status is only editable later; the ATM is chosen at creation and then locked; "Unassigned" is sent to the API as `null`:
+
+**`frontend/src/pages/ServiceCallsPage.jsx`**
+
+```jsx
+import { useAuth } from '../AuthContext.jsx'
+import CrudPage from '../components/CrudPage.jsx'
+import StatusChip from '../components/StatusChip.jsx'
+import { PRIORITIES, SERVICE_STATUSES, toOptions } from '../constants.js'
+import { useApi } from '../hooks/useApi.js'
+import { ROLES } from '../roles.js'
+import TechnicianServiceCallsPage from './TechnicianServiceCallsPage.jsx'
+
+const COLUMNS = [
+  { field: 'title', headerName: 'Title', flex: 1.5, minWidth: 220 },
+  {
+    field: 'priority',
+    headerName: 'Priority',
+    width: 120,
+    renderCell: (params) => <StatusChip status={params.value} />,
+  },
+  {
+    field: 'status',
+    headerName: 'Status',
+    width: 140,
+    renderCell: (params) => <StatusChip status={params.value} />,
+  },
+  { field: 'atm_serial_number', headerName: 'ATM', width: 100 },
+  { field: 'atm_model', headerName: 'ATM model', flex: 1, minWidth: 170 },
+  { field: 'branch_name', headerName: 'Branch', flex: 1, minWidth: 120 },
+  {
+    field: 'technician_name',
+    headerName: 'Technician',
+    flex: 1,
+    minWidth: 140,
+    valueGetter: (value) => value ?? 'Unassigned',
+  },
+]
+
+const describeRow = (row) => `service call "${row.title}"`
+
+// '' means "no technician" in the form; the API wants null for that
+const technicianIdFor = (values) => (values.technician_id === '' ? null : Number(values.technician_id))
+
+// row is the call being edited, or null when adding one
+function toPayload(values, row) {
+  const shared = {
+    title: values.title,
+    priority: values.priority,
+    technician_id: technicianIdFor(values),
+  }
+  if (row === null) return { ...shared, atm_id: Number(values.atm_id) }
+  return { ...shared, status: values.status }
+}
+
+export default function ServiceCallsPage() {
+  const { user } = useAuth()
+  // A Field Technician gets their own page, with status buttons and reports
+  if (user.role === ROLES.TECHNICIAN) return <TechnicianServiceCallsPage />
+  return <ServiceCallsManager canManage={user.role === ROLES.ADMIN} />
+}
+
+function ServiceCallsManager({ canManage }) {
+  // Only the Admin's Add/Edit form needs these dropdown lists
+  const { data: atms, loading: atmsLoading } = useApi('/atms', { skip: !canManage })
+  const { data: technicians, loading: techniciansLoading } = useApi('/technicians', {
+    skip: !canManage,
+  })
+
+  const getFields = (row) => [
+    { name: 'title', label: 'Title', required: true },
+    {
+      name: 'priority',
+      label: 'Priority',
+      type: 'select',
+      required: true,
+      defaultValue: 'Medium',
+      options: toOptions(PRIORITIES),
+    },
+    // The ATM is chosen when a call is created; it cannot be changed afterwards
+    {
+      name: 'atm_id',
+      label: 'ATM',
+      type: 'select',
+      required: true,
+      disabled: row !== null,
+      options: (atms ?? []).map((atm) => ({
+        value: atm.id,
+        label: `${atm.serial_number} · ${atm.branch_name}`,
+      })),
+    },
+    // A new call always starts as Pending, so status is only editable later
+    {
+      name: 'status',
+      label: 'Status',
+      type: 'select',
+      required: true,
+      options: toOptions(SERVICE_STATUSES),
+      visible: () => row !== null,
+    },
+    {
+      name: 'technician_id',
+      label: 'Technician',
+      type: 'select',
+      options: [
+        { value: '', label: 'Unassigned' },
+        ...(technicians ?? []).map((t) => ({ value: t.id, label: t.name })),
+      ],
+    },
+  ]
+
+  return (
+    <CrudPage
+      title="Service calls"
+      singular="service call"
+      path="/service-calls"
+      columns={COLUMNS}
+      getFields={getFields}
+      toFormValues={(row) => ({ ...row, technician_id: row.technician_id ?? '' })}
+      toPayload={toPayload}
+      describeRow={describeRow}
+      canManage={canManage}
+      ready={!atmsLoading && !techniciansLoading}
+      searchLabel="Search service calls"
+      pageSize={5}
+    />
+  )
+}
+```
+
+**22d. Routes.** Branches and Technicians for Admin and Auditor, Users for Admin only:
+
+**`frontend/src/App.jsx`**
+
+```jsx
+import { BrowserRouter, Navigate, Route, Routes } from 'react-router'
+
+import { AuthProvider } from './AuthContext.jsx'
+import ProtectedRoute from './ProtectedRoute.jsx'
+import RequireRole from './RequireRole.jsx'
+import Layout from './components/Layout.jsx'
+import AtmsPage from './pages/AtmsPage.jsx'
+import BranchesPage from './pages/BranchesPage.jsx'
+import DashboardPage from './pages/DashboardPage.jsx'
+import LoginPage from './pages/LoginPage.jsx'
+import ServiceCallsPage from './pages/ServiceCallsPage.jsx'
+import TechniciansPage from './pages/TechniciansPage.jsx'
+import UsersPage from './pages/UsersPage.jsx'
+import { ROLES } from './roles.js'
+
+export default function App() {
+  return (
+    <BrowserRouter>
+      <AuthProvider>
+        <Routes>
+          <Route path="/login" element={<LoginPage />} />
+          <Route element={<ProtectedRoute />}>
+            <Route element={<Layout />}>
+              {/* Every role */}
+              <Route path="/atms" element={<AtmsPage />} />
+              <Route path="/service-calls" element={<ServiceCallsPage />} />
+
+              {/* Admin and Auditor (the Auditor sees these read-only) */}
+              <Route element={<RequireRole roles={[ROLES.ADMIN, ROLES.AUDITOR]} />}>
+                <Route path="/" element={<DashboardPage />} />
+                <Route path="/branches" element={<BranchesPage />} />
+                <Route path="/technicians" element={<TechniciansPage />} />
+              </Route>
+
+              {/* Admin only */}
+              <Route element={<RequireRole roles={[ROLES.ADMIN]} />}>
+                <Route path="/users" element={<UsersPage />} />
+              </Route>
+            </Route>
+          </Route>
+          <Route path="*" element={<Navigate to="/" replace />} />
+        </Routes>
+      </AuthProvider>
+    </BrowserRouter>
+  )
+}
+```
+
+**22e. Try it.** Signed in as the Admin:
+
+1. **Branches:** **Add branch**, fill in the four fields and save. Try deleting a branch that has ATMs and read the refusal message inside the dialog. Delete the branch you just added; that works.
+2. **ATMs:** click the pencil on an ATM. The serial number is locked. The cash field refuses anything above 10,000.
+3. **Service calls:** **Add service call** with an ATM and a technician. Edit it, set the status to In-Progress and choose Unassigned.
+4. **Technicians:** add one, then edit it and move it to another branch.
+5. **Users:** **Add user**, pick **Field Technician** and notice the Technician dropdown appears; pick **Auditor** and it disappears. Try deleting your own account (refused).
+6. Sign in as the **Auditor**: every page is read-only (no Add button, no Edit/Delete buttons), and typing `/users` sends you away.
+
+> **Troubleshooting a blank page.** A blank browser page almost always means a compile or import error. Run `npm run build` in `frontend/`: it prints a clear message such as `"default" is not exported by "src/components/FormDialog.jsx"` and fails (a successful run ends with `built in ...`). The usual cause is a file that was pasted but not **saved**, leaving it empty on disk. The browser's developer console (`Cmd+Option+J` in Chrome) shows the same error in red.
+
+---
+
 ---
 
 ## 6. Roadmap
@@ -3562,11 +6230,14 @@ Planned steps. Each becomes a numbered step above once built.
 - [x] Seed script with sample data covering every metric
 - [x] Backend metrics endpoints (low cash, technician mismatches, completion ratio by model, maintenance alerts, technicians per supervisor)
 - [x] Frontend: app layout (top bar, navigation) and dashboard with metric cards, alerts and status badges
-- [ ] Frontend: DataGrid pages for ATMs and service calls (sorting, search, pagination)
-- [ ] Simulation logic (ATM cash levels, service dispatch)
+- [x] Frontend: DataGrid pages for ATMs and service calls (sorting, search, pagination)
+- [x] Role-based access control, backend (Operations Admin, Field Technician, Auditor)
+- [x] Role-aware frontend (per-role navigation, technician work screens, read-only Auditor)
+- [x] Admin management screens (create, edit, delete)
+- [ ] Simulation logic (ATM cash levels, service dispatch) *(optional)*
 - [x] Frontend: React + Material UI project setup
 - [x] Connect frontend to backend (API calls, CORS) — API helper and login done
-- [ ] Tests
+- [ ] Automated tests *(optional; see the note at the end of Step 20)*
 - [ ] Deployment notes
 
 ---
@@ -3577,6 +6248,7 @@ Planned steps. Each becomes a numbered step above once built.
 - **CORS** – A browser security rule that blocks a frontend on one address from calling a backend on another unless the backend allows it.
 - **Bearer token** – A token sent in the `Authorization: Bearer <token>` header to prove who you are.
 - **Aggregation** – Combining many rows into a summary value, such as a count or percentage, usually with `GROUP BY`.
+- **DataGrid** – A Material UI table component with built-in sorting, filtering and pagination.
 - **Dependency** – A library your project relies on.
 - **Foreign key** – A column holding the `id` of a row in another table, linking the two.
 - **Enum** – A type limited to a fixed list of named values.

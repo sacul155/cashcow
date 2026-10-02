@@ -3,6 +3,7 @@ from sqlalchemy.orm import Session
 
 from app import metrics
 from app.database import get_db
+from app.dependencies import read_all
 from app.schemas.metrics import (
     Dashboard,
     LowCashReport,
@@ -12,8 +13,7 @@ from app.schemas.metrics import (
     TechnicianMismatch,
 )
 
-router = APIRouter(prefix="/metrics", tags=["metrics"])
-
+router = APIRouter(prefix="/metrics", tags=["metrics"], dependencies=[Depends(read_all)])
 
 @router.get("/low-cash-atms", response_model=LowCashReport)
 def get_low_cash_atms(db: Session = Depends(get_db)):

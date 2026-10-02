@@ -2,10 +2,10 @@ import argparse
 import sys
 from decimal import Decimal
 
-from sqlalchemy import text
+from sqlalchemy import delete, text
 
 from app.database import SessionLocal
-from app.models import ATM, Branch, Report, ServiceCall, Technician
+from app.models import ATM, Branch, Report, ServiceCall, Technician, User
 from app.models.enums import ATMStatus, ServicePriority, ServiceStatus
 
 OPERATIONAL = ATMStatus.OPERATIONAL
@@ -93,12 +93,15 @@ REPORTS = [
 
 
 def seed(db):
-    db.execute(
-        text(
-            "TRUNCATE TABLE reports, service_calls, atms, technicians, branches "
-            "RESTART IDENTITY CASCADE"
-        )
-    )
+    # Field Technician logins point at technician rows that are about to be replaced, so they
+    # are removed too. Admin and Auditor accounts are left alone.
+    db.execute(delete(User).where(User.technician_id.is_not(None)))
+    # Delete children before parents, then restart the id counters so ids begin at 1 again.
+    # (TRUNCATE ... CASCADE would also wipe the users table, which references technicians.)
+    for model in (Report, ServiceCall, ATM, Technician, Branch):
+        db.execute(delete(model))
+    for table in ("reports", "service_calls", "atms", "technicians", "branches"):
+        db.execute(text(f"ALTER SEQUENCE {table}_id_seq RESTART WITH 1"))
 
     branches = [
         Branch(name=name, region=region, capacity=capacity, supervisor_id=supervisor_id)
@@ -156,7 +159,8 @@ def main():
     if not args.yes:
         answer = input(
             "This DELETES all branches, technicians, ATMs, service calls and reports, "
-            "then loads sample data.\n(Users are not touched.) Type 'yes' to continue: "
+            "then loads sample data.\n(Admin and Auditor logins are kept; Field Technician logins are removed.) "
+            "Type 'yes' to continue: "
         )
         if answer.strip().lower() != "yes":
             sys.exit("Cancelled")

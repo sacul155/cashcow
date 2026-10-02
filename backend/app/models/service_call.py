@@ -23,8 +23,10 @@ class ServiceCall(Base):
 
     atm: Mapped["ATM"] = relationship(back_populates="service_calls")
     technician: Mapped["Technician | None"] = relationship(back_populates="service_calls")
-    reports: Mapped[list["Report"]] = relationship(back_populates="service_call")
-
+    reports: Mapped[list["Report"]] = relationship(
+        back_populates="service_call", cascade="all, delete-orphan"
+    )
+    
     @property
     def atm_serial_number(self) -> str:
         return self.atm.serial_number

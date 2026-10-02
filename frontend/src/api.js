@@ -39,5 +39,6 @@ export async function apiFetch(path, { skipAuth = false, headers: extraHeaders, 
     const detail = Array.isArray(body?.detail) ? body.detail[0].msg : body?.detail
     throw new ApiError(response.status, detail || 'Request failed')
   }
-  return response.json()
-}
+  // A successful DELETE answers 204 with no body
+  if (response.status === 204) return null
+  return response.json()}

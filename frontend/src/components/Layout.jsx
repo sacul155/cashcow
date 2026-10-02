@@ -1,13 +1,8 @@
-import { AppBar, Box, Button, Container, Toolbar, Typography } from '@mui/material'
+import { AppBar, Box, Button, Chip, Container, Toolbar, Typography } from '@mui/material'
 import { NavLink, Outlet } from 'react-router'
 
 import { useAuth } from '../AuthContext.jsx'
-
-const NAV_ITEMS = [
-  { label: 'Dashboard', to: '/' },
-  { label: 'ATMs', to: '/atms' },
-  { label: 'Service Calls', to: '/service-calls' },
-]
+import { navItemsFor } from '../roles.js'
 
 export default function Layout() {
   const { user, logout } = useAuth()
@@ -20,7 +15,7 @@ export default function Layout() {
             CashCow
           </Typography>
           <Box sx={{ flexGrow: 1, display: 'flex', gap: 1 }}>
-            {NAV_ITEMS.map((item) => (
+            {navItemsFor(user.role).map((item) => (
               <Button
                 key={item.to}
                 color="inherit"
@@ -33,6 +28,12 @@ export default function Layout() {
               </Button>
             ))}
           </Box>
+          <Chip
+            label={user.role}
+            size="small"
+            variant="outlined"
+            sx={{ mr: 2, color: 'inherit', borderColor: 'rgba(255, 255, 255, 0.6)' }}
+          />
           <Typography variant="body2" sx={{ mr: 2 }}>
             {user.full_name}
           </Typography>

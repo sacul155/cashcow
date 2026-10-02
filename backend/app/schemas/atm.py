@@ -17,6 +17,7 @@ class ATMUpdate(BaseModel):
     model: str | None = Field(default=None, min_length=1, max_length=100)
     status: ATMStatus | None = None
     cash_level: Decimal | None = Field(default=None, ge=0, le=10000, max_digits=12, decimal_places=2)
+    branch_id: int | None = None
 
 
 class ATMRead(ATMCreate):

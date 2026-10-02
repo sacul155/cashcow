@@ -5,6 +5,7 @@ from sqlalchemy.orm import Session
 from app.database import get_db
 from app.models import User
 from app.security import decode_access_token
+from app.models.enums import UserRole
 
 bearer_scheme = HTTPBearer(auto_error=False)
 
@@ -27,3 +28,20 @@ def get_current_user(
     if user is None:
         raise unauthorized
     return user
+
+
+
+def require_roles(*roles: UserRole):
+    """Build a dependency that only lets users with one of the given roles through."""
+
+    def check_role(user: User = Depends(get_current_user)) -> User:
+        if user.role not in roles:
+            raise HTTPException(status_code=403, detail="You do not have permission to do this")
+        return user
+
+    return check_role
+
+
+admin_only = require_roles(UserRole.ADMIN)
+# Roles that may see everything (but only the Admin may change anything)
+read_all = require_roles(UserRole.ADMIN, UserRole.AUDITOR)

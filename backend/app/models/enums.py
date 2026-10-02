@@ -17,3 +17,10 @@ class ServiceStatus(str, Enum):
     COMPLETED = "Completed"
     FAILED = "Failed"
 
+class UserRole(str, Enum):
+    ADMIN = "Operations Admin"
+    TECHNICIAN = "Field Technician"
+    AUDITOR = "Auditor"
+
+# A service call that is still open
+ACTIVE_CALL_STATUSES = (ServiceStatus.PENDING, ServiceStatus.IN_PROGRESS)
